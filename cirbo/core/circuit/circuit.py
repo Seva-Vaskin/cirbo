@@ -200,7 +200,7 @@ class Circuit(Function):
             return _parser.convert_to_circuit(s)
 
     @staticmethod
-    def from_aig_file(file_path: str) -> "Circuit":
+    def from_aig_file(file_path: str, *, binary: tp.Optional[bool] = None) -> "Circuit":
         """
         Initialize the circuit from an AIG format file.
 
@@ -208,33 +208,36 @@ class Circuit(Function):
         circuits (without latches) are supported.
 
         :param file_path: path to the .aag or .aig file.
+        :param binary: if True, parse as binary format; if False, parse as ASCII format;
+            if None (default), auto-detect based on file extension or header.
         :return: parsed Circuit object.
 
         """
         from cirbo.core.parser.aig import AIGParser
 
         parser = AIGParser()
-        return parser.parse_file(file_path)
+        return parser.parse_file(file_path, binary=binary)
 
     @staticmethod
-    def from_aig_string(string: str) -> "Circuit":
+    def from_aig_string(string: str, *, binary: tp.Optional[bool] = None) -> "Circuit":
         """
         Initialize the circuit from an AIG format string.
 
-        Only ASCII AIG format (.aag) is supported for string input. Only combinational
-        circuits (without latches) are supported.
+        Only combinational circuits (without latches) are supported.
 
-        :param string: string containing AIG data in ASCII format.
+        :param string: string containing AIG data.
+        :param binary: if True, raises error (binary not supported for strings); if
+            False or None, parse as ASCII format.
         :return: parsed Circuit object.
 
         """
         from cirbo.core.parser.aig import AIGParser
 
         parser = AIGParser()
-        return parser.parse_string(string)
+        return parser.parse_string(string, binary=binary)
 
     @staticmethod
-    def from_aig_bytes(data: bytes) -> "Circuit":
+    def from_aig_bytes(data: bytes, *, binary: tp.Optional[bool] = None) -> "Circuit":
         """
         Initialize the circuit from AIG format bytes.
 
@@ -242,13 +245,15 @@ class Circuit(Function):
         circuits (without latches) are supported.
 
         :param data: bytes containing AIG data.
+        :param binary: if True, parse as binary format; if False, parse as ASCII format;
+            if None (default), auto-detect based on header.
         :return: parsed Circuit object.
 
         """
         from cirbo.core.parser.aig import AIGParser
 
         parser = AIGParser()
-        return parser.parse_bytes(data)
+        return parser.parse_bytes(data, binary=binary)
 
     @staticmethod
     def bare_circuit_with_labels(

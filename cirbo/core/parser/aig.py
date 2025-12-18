@@ -44,58 +44,80 @@ class AIGParser:
         self._literal_to_label: dict[int, gate.Label] = {}
         self._symbols: dict[str, dict[int, str]] = {'i': {}, 'o': {}, 'l': {}}
 
-    def parse_file(self, file_path: str) -> Circuit:
+    def parse_file(
+        self, file_path: str, *, binary: tp.Optional[bool] = None
+    ) -> Circuit:
         """
         Parse an AIG file and return a Circuit.
 
         :param file_path: path to the .aag or .aig file.
+        :param binary: if True, parse as binary format; if False, parse as ASCII format;
+            if None (default), auto-detect based on file extension or header.
         :return: parsed Circuit object.
 
         """
         path = pathlib.Path(file_path)
-        if path.suffix == '.aag':
-            with path.open('r') as f:
-                return self._parse_ascii(f)
-        elif path.suffix == '.aig':
+
+        if binary:
+            # Force binary parsing
             with path.open('rb') as f:
-                return self._parse_binary(f)
+                return self._parse_binary(f, strict_header=False)
+        elif binary is False:
+            # Force ASCII parsing
+            with path.open('r') as f:
+                return self._parse_ascii(f, strict_header=False)
         else:
-            # Try to detect format from header
-            with path.open('rb') as f:
-                header_start = f.read(3)
-                f.seek(0)
-                if header_start == b'aag':
-                    # Re-open as text
-                    pass
-                elif header_start == b'aig':
+            # Auto-detect
+            if path.suffix == '.aag':
+                with path.open('r') as f:
+                    return self._parse_ascii(f)
+            elif path.suffix == '.aig':
+                with path.open('rb') as f:
                     return self._parse_binary(f)
-                else:
-                    raise AIGParseError(
-                        f"Unknown file format. Header starts with: {header_start!r}"
+            else:
+                raise AIGParseError(
+                        f"Unknown file extension. File extension is: {path.suffix}"
                     )
-            with path.open('r') as f:
-                return self._parse_ascii(f)
 
-    def parse_string(self, content: str) -> Circuit:
+    def parse_string(
+        self, content: str, *, binary: tp.Optional[bool] = None
+    ) -> Circuit:
         """
-        Parse an AIG string (ASCII format only) and return a Circuit.
+        Parse an AIG string and return a Circuit.
 
-        :param content: string containing AIG data in ASCII format.
+        :param content: string containing AIG data.
+        :param binary: if True, parse as binary format (not supported for strings); if
+            False or None, parse as ASCII format.
         :return: parsed Circuit object.
 
         """
+        if binary is True:
+            raise AIGParseError(
+                "Binary format parsing is not supported for string input. "
+                "Use parse_bytes() instead."
+            )
+        strict_header = binary is None
         with io.StringIO(content) as f:
-            return self._parse_ascii(f)
+            return self._parse_ascii(f, strict_header=strict_header)
 
-    def parse_bytes(self, content: bytes) -> Circuit:
+    def parse_bytes(
+        self, content: bytes, *, binary: tp.Optional[bool] = None
+    ) -> Circuit:
         """
-        Parse AIG bytes (can be ASCII or binary format) and return a Circuit.
+        Parse AIG bytes and return a Circuit.
 
         :param content: bytes containing AIG data.
+        :param binary: if True, parse as binary format; if False, parse as ASCII format;
+            if None (default), auto-detect based on header.
         :return: parsed Circuit object.
 
         """
-        if content.startswith(b'aag'):
+        if binary is True:
+            with io.BytesIO(content) as f:
+                return self._parse_binary(f, strict_header=False)
+        elif binary is False:
+            return self.parse_string(content.decode('ascii'), binary=False)
+        elif content.startswith(b'aag'):
             return self.parse_string(content.decode('ascii'))
         elif content.startswith(b'aig'):
             with io.BytesIO(content) as f:
@@ -103,8 +125,15 @@ class AIGParser:
         else:
             raise AIGParseError("Unknown format. Must start with 'aag' or 'aig'.")
 
-    def _parse_ascii(self, stream: tp.TextIO) -> Circuit:
-        """Parse ASCII AIG format (.aag)."""
+    def _parse_ascii(self, stream: tp.TextIO, *, strict_header: bool = True) -> Circuit:
+        """
+        Parse ASCII AIG format (.aag).
+
+        :param stream: text stream to parse.
+        :param strict_header: if True, only accept 'aag' header; if False, accept both
+            'aag' and 'aig' headers.
+
+        """
         self._circuit = Circuit()
         self._literal_to_label = {}
         self._symbols = {'i': {}, 'o': {}, 'l': {}}
@@ -113,7 +142,8 @@ class AIGParser:
         header_line = stream.readline().strip()
         header_parts = header_line.split()
 
-        if len(header_parts) < 6 or header_parts[0] != 'aag':
+        valid_headers = ['aag'] if strict_header else ['aag', 'aig']
+        if len(header_parts) < 6 or header_parts[0] not in valid_headers:
             raise AIGParseError(f"Invalid AAG header: {header_line}")
 
         m, i, l, o, a = map(int, header_parts[1:6])
@@ -228,8 +258,17 @@ class AIGParser:
         for lhs, _, _ in and_gates:
             create_gate(lhs)
 
-    def _parse_binary(self, stream: tp.BinaryIO) -> Circuit:
-        """Parse binary AIG format (.aig)."""
+    def _parse_binary(
+        self, stream: tp.BinaryIO, *, strict_header: bool = True
+    ) -> Circuit:
+        """
+        Parse binary AIG format (.aig).
+
+        :param stream: binary stream to parse.
+        :param strict_header: if True, only accept 'aig' header; if False, accept both
+            'aag' and 'aig' headers.
+
+        """
         self._circuit = Circuit()
         self._literal_to_label = {}
         self._symbols = {'i': {}, 'o': {}, 'l': {}}
@@ -247,7 +286,8 @@ class AIGParser:
         header_str = header_line.decode('ascii').strip()
         header_parts = header_str.split()
 
-        if len(header_parts) < 6 or header_parts[0] != 'aig':
+        valid_headers = ['aig'] if strict_header else ['aag', 'aig']
+        if len(header_parts) < 6 or header_parts[0] not in valid_headers:
             raise AIGParseError(f"Invalid AIG header: {header_str}")
 
         m, i, l, o, a = map(int, header_parts[1:6])
