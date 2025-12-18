@@ -89,7 +89,7 @@ def tseytin_transformation(
     for output_index in outputs:
         output_lit = process_gate(circuit.output_at_index(output_index))
         cnf.append([output_lit])
-    return Cnf(cnf)
+    return Cnf(cnf, var_map=dict(saved_lits))
 
 
 def _process_input(_: CnfRaw, __: Lit, ___: list[Lit]):
