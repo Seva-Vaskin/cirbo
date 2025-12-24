@@ -794,3 +794,149 @@ class TestCnCSolverMultiOutput:
         
         assert result.answer is True
         assert result.model is not None
+
+
+# =============================================================================
+# Test Class: max_depth Parameter Tests
+# =============================================================================
+
+
+class TestCnCSolverMaxDepth:
+    """Tests for the max_depth parameter that limits cube recursion depth."""
+
+    def test_max_depth_zero_produces_single_cube(self):
+        """Test that max_depth=0 stops immediately and produces 1 cube."""
+        circuit = Circuit()
+        circuit.add_gate(Gate('a', INPUT))
+        circuit.add_gate(Gate('b', INPUT))
+        circuit.add_gate(Gate('and', AND, ('a', 'b')))
+        circuit.mark_as_output('and')
+
+        solver = CubeAndConquerSolver(max_depth=0)
+        cubes = solver.cube(circuit)
+
+        # With max_depth=0, we stop immediately without splitting
+        assert len(cubes) == 1
+
+    def test_max_depth_one_produces_at_most_two_cubes(self):
+        """Test that max_depth=1 produces at most 2 cubes (one split)."""
+        circuit = Circuit()
+        circuit.add_gate(Gate('a', INPUT))
+        circuit.add_gate(Gate('b', INPUT))
+        circuit.add_gate(Gate('c', INPUT))
+        circuit.add_gate(Gate('and1', AND, ('a', 'b')))
+        circuit.add_gate(Gate('and2', AND, ('and1', 'c')))
+        circuit.mark_as_output('and2')
+
+        solver = CubeAndConquerSolver(max_depth=1)
+        cubes = solver.cube(circuit)
+
+        # With max_depth=1, we do at most one split (2 cubes max)
+        assert len(cubes) <= 2
+
+    def test_max_depth_none_no_limit(self):
+        """Test that max_depth=None (default) behaves as before - no limit."""
+        circuit = Circuit()
+        circuit.add_gate(Gate('a', INPUT))
+        circuit.add_gate(Gate('b', INPUT))
+        circuit.add_gate(Gate('and', AND, ('a', 'b')))
+        circuit.mark_as_output('and')
+
+        solver_default = CubeAndConquerSolver()
+        solver_none = CubeAndConquerSolver(max_depth=None)
+
+        cubes_default = solver_default.cube(circuit)
+        cubes_none = solver_none.cube(circuit)
+
+        # Both should produce the same result
+        assert len(cubes_default) == len(cubes_none)
+
+    def test_max_depth_still_produces_correct_sat_result(self):
+        """Test that solver with max_depth still produces correct SAT result."""
+        # Simple satisfiable circuit
+        circuit = Circuit()
+        circuit.add_gate(Gate('a', INPUT))
+        circuit.add_gate(Gate('b', INPUT))
+        circuit.add_gate(Gate('and', AND, ('a', 'b')))
+        circuit.mark_as_output('and')
+
+        solver = CubeAndConquerSolver(max_depth=1)
+        result = solver.solve(circuit)
+
+        assert result.answer is True
+        assert result.model is not None
+
+    def test_max_depth_still_produces_correct_unsat_result(self):
+        """Test that solver with max_depth still produces correct UNSAT result."""
+        # Unsatisfiable circuit: x AND NOT(x)
+        circuit = Circuit()
+        circuit.add_gate(Gate('x', INPUT))
+        circuit.add_gate(Gate('not_x', NOT, ('x',)))
+        circuit.add_gate(Gate('out', AND, ('x', 'not_x')))
+        circuit.mark_as_output('out')
+
+        solver = CubeAndConquerSolver(max_depth=1)
+        result = solver.solve(circuit)
+
+        assert result.answer is False
+        assert result.model is None
+
+    def test_higher_depth_produces_more_cubes(self):
+        """Test that higher max_depth can produce more cubes."""
+        circuit = Circuit()
+        circuit.add_gate(Gate('a', INPUT))
+        circuit.add_gate(Gate('b', INPUT))
+        circuit.add_gate(Gate('c', INPUT))
+        circuit.add_gate(Gate('and1', AND, ('a', 'b')))
+        circuit.add_gate(Gate('and2', AND, ('and1', 'c')))
+        circuit.mark_as_output('and2')
+
+        solver_depth_0 = CubeAndConquerSolver(max_depth=0)
+        solver_depth_1 = CubeAndConquerSolver(max_depth=1)
+        solver_depth_2 = CubeAndConquerSolver(max_depth=2)
+
+        cubes_0 = solver_depth_0.cube(circuit)
+        cubes_1 = solver_depth_1.cube(circuit)
+        cubes_2 = solver_depth_2.cube(circuit)
+
+        # Higher depth should generally allow more cubes
+        assert len(cubes_0) <= len(cubes_1) <= len(cubes_2)
+
+    def test_max_depth_higher_than_natural_depth(self):
+        """Test that when max_depth exceeds natural recursion depth, result matches unlimited."""
+        # Simple circuit that naturally stops early
+        circuit = Circuit()
+        circuit.add_gate(Gate('a', INPUT))
+        circuit.add_gate(Gate('b', INPUT))
+        circuit.add_gate(Gate('and', AND, ('a', 'b')))
+        circuit.mark_as_output('and')
+
+        # max_depth=1000 is way higher than what this circuit needs
+        solver_high_depth = CubeAndConquerSolver(max_depth=1000)
+        solver_unlimited = CubeAndConquerSolver(max_depth=None)
+
+        cubes_high = solver_high_depth.cube(circuit)
+        cubes_unlimited = solver_unlimited.cube(circuit)
+
+        # Both should produce the same number of cubes since natural stop occurs first
+        assert len(cubes_high) == len(cubes_unlimited)
+
+    def test_max_depth_is_limiting_factor(self):
+        """Test that max_depth actually limits when it's lower than natural depth."""
+        # Use XOR circuit which is known to require multiple cubes
+        xor_ckt = create_aig_xor()
+
+        solver_depth_0 = CubeAndConquerSolver(max_depth=0)
+        solver_depth_1 = CubeAndConquerSolver(max_depth=1)
+        solver_unlimited = CubeAndConquerSolver(max_depth=None)
+
+        cubes_depth_0 = solver_depth_0.cube(xor_ckt)
+        cubes_depth_1 = solver_depth_1.cube(xor_ckt)
+        cubes_unlimited = solver_unlimited.cube(xor_ckt)
+
+        # max_depth=0 should produce exactly 1 cube (no splitting)
+        assert len(cubes_depth_0) == 1
+        # max_depth=1 should produce at most 2 cubes
+        assert len(cubes_depth_1) <= 2
+        # Unlimited should produce at least as many as depth_1
+        assert len(cubes_depth_1) <= len(cubes_unlimited)

@@ -9,12 +9,15 @@ from cirbo.sat.solver.circuit_sat_instance import CircuitSatInstance, Assignment
 
 class CubeAndConquerSolver:
 
+    def __init__(self, max_depth: int | None = None):
+        self.max_depth = max_depth
+
     def solve(self, circuit: Circuit) -> PySatResult:
         cubes = self.cube(circuit)
         result = self.conquer(cubes)
         return result
 
-    def cube(self, circuit: Circuit) -> tp.List[CircuitSatInstance]:
+    def cube(self, circuit: Circuit) -> list[CircuitSatInstance]:
         circuit_sat_instance = CircuitSatInstance.from_circuit(circuit)
 
         if circuit_sat_instance is None:
@@ -22,11 +25,11 @@ class CubeAndConquerSolver:
 
         return self._cube(circuit_sat_instance)
 
-    def conquer(self, cubes: tp.List[CircuitSatInstance]) -> PySatResult:
+    def conquer(self, cubes: list[CircuitSatInstance]) -> PySatResult:
         for instance in cubes:
             is_sat = self.is_sat(instance)
             if is_sat:
-                model: tp.List[int] = [0] * len(instance.gates_config)
+                model: list[int] = [0] * len(instance.gates_config)
                 for gate_conf in instance.gates_config.values():
                     if not gate_conf.is_input:
                         continue
@@ -36,20 +39,20 @@ class CubeAndConquerSolver:
                 return PySatResult(answer=True, model=model)
         return PySatResult(answer=False, model=None)
 
-    def _cube(self, instance: CircuitSatInstance) -> tp.List[CircuitSatInstance]:
+    def _cube(self, instance: CircuitSatInstance, depth: int = 0) -> list[CircuitSatInstance]:
         trivial_assignment_status = instance.apply_trivial_assignments()
         if trivial_assignment_status != AssignmentStatus.OK:
             return []
 
-        if self._check_stop_cube(instance):
+        if self._check_stop_cube(instance) or (self.max_depth is not None and depth >= self.max_depth):
             return [instance]
 
         cube_gate = self._select_cube_gate(instance)
-        cubes: tp.List[CircuitSatInstance] = []
+        cubes: list[CircuitSatInstance] = []
         for value in (False, True):
             new_instance = copy.deepcopy(instance)
             new_instance.assign(cube_gate, value)
-            new_cubes = self._cube(new_instance)
+            new_cubes = self._cube(new_instance, depth + 1)
             cubes.extend(new_cubes)
         return cubes
 
