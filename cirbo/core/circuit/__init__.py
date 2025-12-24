@@ -1,4 +1,5 @@
 from cirbo.core.circuit.circuit import Circuit
+from cirbo.core.circuit.converters import convert_gate_to_aig
 from cirbo.core.circuit.gate import (
     ALWAYS_FALSE,
     ALWAYS_TRUE,
@@ -53,4 +54,5 @@ __all__ = [
     'RNOT',
     'XOR',
     'Transformer',
+    'convert_gate_to_aig',
 ]

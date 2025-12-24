@@ -16,7 +16,7 @@ import typing_extensions as tp_ext
 
 from cirbo.core.boolean_function import Function, RawTruthTable
 from cirbo.core.circuit import gate
-from cirbo.core.circuit.converters import convert_gate
+from cirbo.core.circuit.converters import convert_gate, convert_gate_to_aig
 from cirbo.core.circuit.exceptions import (
     CircuitGateAlreadyExistsError,
     CircuitGateIsAbsentError,
@@ -1716,6 +1716,21 @@ class Circuit(Function):
         old_gates = copy.copy(self.gates)
         for cur_gate in old_gates.values():
             convert_gate(cur_gate, self)
+        return self
+
+    def into_aig(self) -> tp_ext.Self:
+        """
+        Convert circuit into AIG format (AND-Inverter Graph).
+
+        AIG format uses only INPUT, AND, NOT, ALWAYS_TRUE, and ALWAYS_FALSE gates.
+        All other gate types are converted to their minimal AIG representation.
+
+        :return: this circuit after modification.
+
+        """
+        old_gates = copy.copy(self.gates)
+        for cur_gate in old_gates.values():
+            convert_gate_to_aig(cur_gate, self)
         return self
 
     def into_graphviz_digraph(
