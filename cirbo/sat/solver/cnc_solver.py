@@ -9,8 +9,13 @@ from cirbo.sat.solver.circuit_sat_instance import CircuitSatInstance, Assignment
 
 class CubeAndConquerSolver:
 
-    def __init__(self, max_depth: int | None = None):
+    def __init__(
+        self,
+        max_depth: int | None = None,
+        solver_name: PySATSolverNames = PySATSolverNames.CADICAL195,
+    ):
         self.max_depth = max_depth
+        self.solver_name = solver_name
 
     def solve(self, circuit: Circuit) -> PySatResult:
         cubes = self.cube(circuit)
@@ -27,13 +32,14 @@ class CubeAndConquerSolver:
 
     def conquer(self, cubes: list[CircuitSatInstance]) -> PySatResult:
         for instance in cubes:
-            is_sat = self.is_sat(instance)
-            if is_sat:
+            sat_result = self._solve_instance(instance)
+            if sat_result.answer:
+                # Build model combining pre-assigned values and SAT solver's model
                 model: list[int] = [0] * len(instance.gates_config)
                 for gate_conf in instance.gates_config.values():
                     if not gate_conf.is_input:
                         continue
-                    assert gate_conf.value is not None
+                    assert sat_result.model is not None
                     lit = gate_conf.idx
                     model[gate_conf.idx - 1] = lit if gate_conf.value else -lit
                 return PySatResult(answer=True, model=model)
@@ -87,10 +93,13 @@ class CubeAndConquerSolver:
         # TODO: Refine stop criteria
         return instance.circuit.input_size == 0
 
-    def is_sat(self, instance: CircuitSatInstance) -> bool:
-        assert self._check_stop_cube(instance)
-        result = is_satisfiable(
+    def _solve_instance(self, instance: CircuitSatInstance) -> PySatResult:
+        """Solve a cube instance and return the full SAT result."""
+        return is_satisfiable(
             cnf=instance.cnf,
-            solver_name=PySATSolverNames.CADICAL195
+            solver_name=self.solver_name,
         )
-        return result.answer
+
+    def is_sat(self, instance: CircuitSatInstance) -> bool:
+        """Check if a cube instance is satisfiable."""
+        return self._solve_instance(instance).answer

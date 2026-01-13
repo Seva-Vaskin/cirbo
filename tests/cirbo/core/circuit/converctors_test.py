@@ -363,3 +363,87 @@ def test_aig_block_preservation():
     # Block should now include the new gates created during conversion
     assert len(C0._blocks['new_block'].gates) > 1
     assert _is_aig_circuit(C0)
+
+
+@pytest.mark.parametrize('num_operands', [2, 3, 4, 5, 8])
+def test_aig_nary_or(num_operands: int):
+    """Test that n-ary OR gates are correctly converted to AIG."""
+    C0 = Circuit()
+    
+    # Create inputs
+    input_labels = [f'in{i}' for i in range(num_operands)]
+    for label in input_labels:
+        C0.add_gate(gate.Gate(label, gate.INPUT))
+    
+    # Create n-ary OR gate
+    C0.add_gate(gate.Gate('or_out', gate.OR, tuple(input_labels)))
+    C0.mark_as_output('or_out')
+    
+    # Get truth table before conversion
+    tt_before = C0.get_truth_table()
+    
+    # Convert to AIG
+    C0.into_aig()
+    
+    # Verify still produces same truth table
+    tt_after = C0.get_truth_table()
+    assert tt_before == tt_after
+    
+    # Verify is valid AIG
+    assert _is_aig_circuit(C0)
+
+
+@pytest.mark.parametrize('num_operands', [2, 3, 4, 5, 8])
+def test_aig_nary_nand(num_operands: int):
+    """Test that n-ary NAND gates are correctly converted to AIG."""
+    C0 = Circuit()
+    
+    # Create inputs
+    input_labels = [f'in{i}' for i in range(num_operands)]
+    for label in input_labels:
+        C0.add_gate(gate.Gate(label, gate.INPUT))
+    
+    # Create n-ary NAND gate
+    C0.add_gate(gate.Gate('nand_out', gate.NAND, tuple(input_labels)))
+    C0.mark_as_output('nand_out')
+    
+    # Get truth table before conversion
+    tt_before = C0.get_truth_table()
+    
+    # Convert to AIG
+    C0.into_aig()
+    
+    # Verify still produces same truth table
+    tt_after = C0.get_truth_table()
+    assert tt_before == tt_after
+    
+    # Verify is valid AIG
+    assert _is_aig_circuit(C0)
+
+
+@pytest.mark.parametrize('num_operands', [2, 3, 4, 5, 8])
+def test_aig_nary_nor(num_operands: int):
+    """Test that n-ary NOR gates are correctly converted to AIG."""
+    C0 = Circuit()
+    
+    # Create inputs
+    input_labels = [f'in{i}' for i in range(num_operands)]
+    for label in input_labels:
+        C0.add_gate(gate.Gate(label, gate.INPUT))
+    
+    # Create n-ary NOR gate
+    C0.add_gate(gate.Gate('nor_out', gate.NOR, tuple(input_labels)))
+    C0.mark_as_output('nor_out')
+    
+    # Get truth table before conversion
+    tt_before = C0.get_truth_table()
+    
+    # Convert to AIG
+    C0.into_aig()
+    
+    # Verify still produces same truth table
+    tt_after = C0.get_truth_table()
+    assert tt_before == tt_after
+    
+    # Verify is valid AIG
+    assert _is_aig_circuit(C0)

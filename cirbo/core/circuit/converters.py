@@ -204,84 +204,162 @@ def convert_gate_to_aig(_gate: gate.Gate, circuit: 'Circuit') -> None:
 
 def _convert_or_to_aig(_gate: gate.Gate, circuit: 'Circuit') -> None:
     """
-    Convert OR(a, b) to AIG: NOT(AND(NOT(a), NOT(b))).
+    Convert OR(a, b, ...) to AIG: NOT(AND(NOT(a), NOT(b), ...)).
 
-    Creates: na=NOT(a), nb=NOT(b), t=AND(na,nb), result=NOT(t)
+    For n operands, creates n NOT gates, then a tree of AND gates, then final NOT.
+    Uses De Morgan's law: OR(a, b, c, ...) = NOT(AND(NOT(a), NOT(b), NOT(c), ...))
 
     """
-    a, b = _gate.operands
+    operands = _gate.operands
     uid = uuid.uuid4().hex
+    new_gates: list[str] = []
 
-    na_label = f'aig_or_na_{_gate.label}_{uid}'
-    nb_label = f'aig_or_nb_{_gate.label}_{uid}'
-    t_label = f'aig_or_t_{_gate.label}_{uid}'
+    # Create NOT gate for each operand
+    not_labels: list[str] = []
+    for i, op in enumerate(operands):
+        not_label = f'aig_or_n{i}_{_gate.label}_{uid}'
+        circuit.emplace_gate(not_label, gate.NOT, (op,))
+        not_labels.append(not_label)
+        new_gates.append(not_label)
+        circuit._remove_user(op, _gate.label)
 
-    circuit.emplace_gate(na_label, gate.NOT, (a,))
-    circuit.emplace_gate(nb_label, gate.NOT, (b,))
-    circuit.emplace_gate(t_label, gate.AND, (na_label, nb_label))
+    # Build AND tree from the NOT outputs
+    current_labels = not_labels
+    and_idx = 0
+    while len(current_labels) > 1:
+        next_labels: list[str] = []
+        for i in range(0, len(current_labels), 2):
+            if i + 1 < len(current_labels):
+                and_label = f'aig_or_and{and_idx}_{_gate.label}_{uid}'
+                circuit.emplace_gate(and_label, gate.AND, (current_labels[i], current_labels[i + 1]))
+                next_labels.append(and_label)
+                new_gates.append(and_label)
+                and_idx += 1
+            else:
+                next_labels.append(current_labels[i])
+        current_labels = next_labels
 
-    # Update user tracking for old operands
-    circuit._remove_user(a, _gate.label)
-    circuit._remove_user(b, _gate.label)
-    circuit._add_user(t_label, _gate.label)
+    # The final AND result
+    final_and_label = current_labels[0]
+    circuit._add_user(final_and_label, _gate.label)
 
-    # Replace gate with NOT(t)
-    circuit._gates[_gate.label] = gate.Gate(_gate.label, gate.NOT, (t_label,))
+    # Replace gate with NOT(final_and)
+    circuit._gates[_gate.label] = gate.Gate(_gate.label, gate.NOT, (final_and_label,))
 
-    _add_new_gates_to_blocks(_gate.label, [na_label, nb_label, t_label], circuit)
+    _add_new_gates_to_blocks(_gate.label, new_gates, circuit)
 
 
 def _convert_nand_to_aig(_gate: gate.Gate, circuit: 'Circuit') -> None:
     """
-    Convert NAND(a, b) to AIG: NOT(AND(a, b)).
+    Convert NAND(a, b, ...) to AIG: NOT(AND(a, b, ...)).
 
-    Creates: t=AND(a,b), result=NOT(t)
+    For n operands, builds an AND tree, then NOT.
 
     """
-    a, b = _gate.operands
+    operands = _gate.operands
     uid = uuid.uuid4().hex
+    new_gates: list[str] = []
 
-    t_label = f'aig_nand_t_{_gate.label}_{uid}'
+    # Remove user tracking for all operands
+    for op in operands:
+        circuit._remove_user(op, _gate.label)
 
-    circuit.emplace_gate(t_label, gate.AND, (a, b))
+    # Build AND tree from operands
+    current_labels = list(operands)
+    and_idx = 0
+    while len(current_labels) > 1:
+        next_labels: list[str] = []
+        for i in range(0, len(current_labels), 2):
+            if i + 1 < len(current_labels):
+                and_label = f'aig_nand_and{and_idx}_{_gate.label}_{uid}'
+                circuit.emplace_gate(and_label, gate.AND, (current_labels[i], current_labels[i + 1]))
+                next_labels.append(and_label)
+                new_gates.append(and_label)
+                and_idx += 1
+            else:
+                next_labels.append(current_labels[i])
+        current_labels = next_labels
 
-    # Update user tracking
-    circuit._remove_user(a, _gate.label)
-    circuit._remove_user(b, _gate.label)
-    circuit._add_user(t_label, _gate.label)
+    # The final AND result
+    final_and_label = current_labels[0]
 
-    # Replace gate with NOT(t)
-    circuit._gates[_gate.label] = gate.Gate(_gate.label, gate.NOT, (t_label,))
+    # If we had more than one operand, we created AND gates
+    # Otherwise final_and_label is the single operand itself
+    if new_gates:
+        circuit._add_user(final_and_label, _gate.label)
+    else:
+        # Single operand case: NAND(a) = NOT(a)
+        pass
 
-    _add_new_gate_to_blocks(_gate.label, t_label, circuit)
+    # Replace gate with NOT(final_and)
+    circuit._gates[_gate.label] = gate.Gate(_gate.label, gate.NOT, (final_and_label,))
+
+    _add_new_gates_to_blocks(_gate.label, new_gates, circuit)
 
 
 def _convert_nor_to_aig(_gate: gate.Gate, circuit: 'Circuit') -> None:
     """
-    Convert NOR(a, b) to AIG: AND(NOT(a), NOT(b)).
+    Convert NOR(a, b, ...) to AIG: AND(NOT(a), NOT(b), ...).
 
-    Creates: na=NOT(a), nb=NOT(b), result=AND(na,nb)
+    For n operands, creates n NOT gates, then builds an AND tree.
+    NOR(a, b, c, ...) = NOT(OR(a, b, c, ...)) = AND(NOT(a), NOT(b), NOT(c), ...)
 
     """
-    a, b = _gate.operands
+    operands = _gate.operands
     uid = uuid.uuid4().hex
+    new_gates: list[str] = []
 
-    na_label = f'aig_nor_na_{_gate.label}_{uid}'
-    nb_label = f'aig_nor_nb_{_gate.label}_{uid}'
+    # Remove user tracking for all original operands
+    for op in operands:
+        circuit._remove_user(op, _gate.label)
 
-    circuit.emplace_gate(na_label, gate.NOT, (a,))
-    circuit.emplace_gate(nb_label, gate.NOT, (b,))
+    # Create NOT gate for each operand
+    not_labels: list[str] = []
+    for i, op in enumerate(operands):
+        not_label = f'aig_nor_n{i}_{_gate.label}_{uid}'
+        circuit.emplace_gate(not_label, gate.NOT, (op,))
+        not_labels.append(not_label)
+        new_gates.append(not_label)
 
-    # Update user tracking
-    circuit._remove_user(a, _gate.label)
-    circuit._remove_user(b, _gate.label)
-    circuit._add_user(na_label, _gate.label)
-    circuit._add_user(nb_label, _gate.label)
+    # Build AND tree from the NOT outputs
+    current_labels = not_labels
+    and_idx = 0
+    while len(current_labels) > 1:
+        next_labels: list[str] = []
+        for i in range(0, len(current_labels), 2):
+            if i + 1 < len(current_labels):
+                and_label = f'aig_nor_and{and_idx}_{_gate.label}_{uid}'
+                circuit.emplace_gate(and_label, gate.AND, (current_labels[i], current_labels[i + 1]))
+                next_labels.append(and_label)
+                new_gates.append(and_label)
+                and_idx += 1
+            else:
+                next_labels.append(current_labels[i])
+        current_labels = next_labels
 
-    # Replace gate with AND(na, nb)
-    circuit._gates[_gate.label] = gate.Gate(_gate.label, gate.AND, (na_label, nb_label))
+    # The final result
+    final_label = current_labels[0]
+    circuit._add_user(final_label, _gate.label)
 
-    _add_new_gates_to_blocks(_gate.label, [na_label, nb_label], circuit)
+    # Replace gate - either with the final AND, or with NOT if single operand
+    if len(operands) == 1:
+        # NOR(a) = NOT(a)
+        circuit._gates[_gate.label] = gate.Gate(_gate.label, gate.NOT, (final_label,))
+    else:
+        # Replace with AND pointing to final_label (identity transformation)
+        # Actually we need to point to final_label properly
+        # Since final_label is an AND gate we created, we can just reuse its operands
+        final_gate = circuit.get_gate(final_label)
+        circuit._gates[_gate.label] = gate.Gate(_gate.label, gate.AND, final_gate.operands)
+        # Remove the now-redundant final AND gate
+        circuit._gates.pop(final_label)
+        new_gates.remove(final_label)
+        # Update user tracking for the operands of the removed gate
+        for op in final_gate.operands:
+            circuit._remove_user(op, final_label)
+            circuit._add_user(op, _gate.label)
+
+    _add_new_gates_to_blocks(_gate.label, new_gates, circuit)
 
 
 def _convert_xor_to_aig(_gate: gate.Gate, circuit: 'Circuit') -> None:
