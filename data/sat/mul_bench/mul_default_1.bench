@@ -1,0 +1,6 @@
+INPUT(0)
+INPUT(1)
+
+new_507ba7ac5b2b4da89ada697460e4607e = AND(0, 1)
+
+OUTPUT(new_507ba7ac5b2b4da89ada697460e4607e)
