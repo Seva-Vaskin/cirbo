@@ -37,7 +37,7 @@ class RemoveConstantGates(Transformer):
 
     def __init__(self):
         super().__init__(post_transformers=(
-            MergeUnaryOperators(),
+            # MergeUnaryOperators(),
         ))
 
     def _transform(self, circuit: Circuit) -> Circuit:
@@ -56,8 +56,17 @@ class RemoveConstantGates(Transformer):
         # Save constants in a mapping: label -> value (True/False)
         const_map: dict[Label, bool] = {}
 
+        # Save label remappings: label -> mapped_label
+        label_remap: dict[Label, Label] = {}
+
+        def resolve_label(lbl: Label) -> Label:
+            return label_remap.get(lbl, lbl)
+
         # Traverse gates in topological order.
         for g in circuit.top_sort(inverse=True):
+            # Resolve operands first
+            resolved_operands = tuple(resolve_label(op) for op in g.operands)
+            
             # Keep inputs.
             if g.gate_type == gate.INPUT:
                 new_circuit.emplace_gate(g.label, g.gate_type, g.operands)
@@ -72,19 +81,19 @@ class RemoveConstantGates(Transformer):
                 continue
 
             # Identify operands that are constants
-            const_indices = [i for i, op in enumerate(g.operands) if op in const_map]
+            const_indices = [i for i, op in enumerate(resolved_operands) if op in const_map]
 
-            # If a gate has no constant operands, keep them as they are.
+            # If a gate has no constant operands
             if not const_indices:
-                new_circuit.emplace_gate(g.label, g.gate_type, g.operands)
+                new_circuit.emplace_gate(g.label, g.gate_type, resolved_operands)
                 continue
 
             # If a gate has one constant operand (Binary gate case)
-            if len(const_indices) == 1 and len(g.operands) == 2:
+            if len(const_indices) == 1 and len(resolved_operands) == 2:
                 const_idx = const_indices[0]
-                const_val = const_map[g.operands[const_idx]]
+                const_val = const_map[resolved_operands[const_idx]]
                 non_const_idx = 1 - const_idx
-                non_const_op = g.operands[non_const_idx]
+                non_const_op = resolved_operands[non_const_idx]
 
                 # Check how the gate relates to the other non-constant input.
                 
@@ -103,18 +112,23 @@ class RemoveConstantGates(Transformer):
                     const_map[g.label] = val0
                 # If the gate is IFF/NOT, save it.
                 elif val0 is False and val1 is True:
-                    # Identity (IFF)
-                    new_circuit.emplace_gate(g.label, gate.IFF, (non_const_op,))
+                    # Identity (IFF) -> Remap to the operand
+                    label_remap[g.label] = non_const_op
                 elif val0 is True and val1 is False:
                     # Invert (NOT)
-                    new_circuit.emplace_gate(g.label, gate.NOT, (non_const_op,))
+                    operand_gate = new_circuit.gates.get(non_const_op)
+                    if operand_gate and operand_gate.gate_type == gate.NOT:
+                         # NOT(NOT(X)) -> X
+                        label_remap[g.label] = operand_gate.operands[0]
+                    else:
+                        new_circuit.emplace_gate(g.label, gate.NOT, (non_const_op,))
                 else:
                     raise RuntimeError(f"Unexpected evaluation result for gate {g.label}: val0={val0}, val1={val1}")
                 continue
 
             # If the gate has two constant operands, evaluate its value and save it in constants.
-            if len(const_indices) == len(g.operands):
-                args = [const_map[op] for op in g.operands]
+            if len(const_indices) == len(resolved_operands):
+                args = [const_map[op] for op in resolved_operands]
                 val = g.operator(*args)
                 const_map[g.label] = val
                 continue
@@ -126,7 +140,10 @@ class RemoveConstantGates(Transformer):
         new_circuit.set_inputs(final_inputs)
 
         # Set outputs to the remaining outputs.
-        final_outputs = [out for out in circuit.outputs if out not in const_map]
+        # We need to resolve outputs that might have been remapped
+        final_outputs = [
+            out for out in map(resolve_label, circuit.outputs) if out not in const_map
+        ]
         new_circuit.set_outputs(final_outputs)
 
         return new_circuit
