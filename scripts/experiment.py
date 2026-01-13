@@ -1,38 +1,58 @@
 """
 Experiment script for comparing baseline SAT solver vs CubeAndConquerSolver
-on circuit verification.
+on miter circuits.
 
-Supports both multiplier circuits (.bench) and sorting circuits (.aig).
+Takes miter circuit files and compares solvers performance.
+Supports .bench, .aig, and .aag formats.
+
+Usage:
+    python experiment.py -i miter1.bench -o report.md
+    python experiment.py -i miter1.bench -i miter2.aig -o report.md --timeout 60
+    python experiment.py -i miter1.bench -o report.md -d 1,2,5,None -m 100,500,None
 """
 
 import argparse
 import copy
-import itertools
-import re
+import signal
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from cirbo.core import Circuit
-from cirbo.sat import PySATSolverNames, build_miter, is_circuit_satisfiable
+from cirbo.core.circuit import Transformer
+from cirbo.minimization import RemoveRedundantGates, MergeUnaryOperators
+from cirbo.minimization.simplification import RemoveConstantGates, MergeDuplicateGates
+from cirbo.sat import PySATSolverNames, is_circuit_satisfiable
 from cirbo.sat.solver.cnc_solver import CubeAndConquerSolver
+
+
+class SolverTimeout(Exception):
+    """Raised when a solver times out."""
+    pass
+
+
+def timeout_handler(signum, frame):
+    raise SolverTimeout("Solver timed out")
 
 
 @dataclass
 class ExperimentResult:
-    circuit1_name: str
-    circuit2_name: str
-    baseline_result: bool
-    baseline_time: float
-    cnc_result: bool
-    cnc_cube_time: float
-    cnc_conquer_time: float
-    cnc_total_time: float
-    cnc_cubes: int
+    miter_name: str
+    baseline_result: bool | None
+    baseline_time: float | None
+    baseline_timed_out: bool
+    cnc_result: bool | None
+    cnc_cube_time: float | None
+    cnc_conquer_time: float | None
+    cnc_total_time: float | None
+    cnc_cubes: int | None
+    cnc_timed_out: bool
     max_depth: int | None
+    min_circuit_size: int | None
     solver_name: str
-    match: bool
-    conquer_faster: bool  # True if conquer time (without cube) < baseline time
+    match: bool | None
+    conquer_faster: bool | None
 
 
 def load_circuit(file_path: Path) -> Circuit:
@@ -46,205 +66,141 @@ def load_circuit(file_path: Path) -> Circuit:
         raise ValueError(f"Unsupported file format: {suffix}")
 
 
-def parse_multiplier_name(filename: str) -> tuple[str, str]:
+def run_baseline(
+    miter: Circuit,
+    solver_name: PySATSolverNames,
+    timeout: int | None = None,
+) -> tuple[bool | None, float | None, bool]:
     """
-    Parse multiplier filename like 'mul_alter_4' or 'mul_pow2_m1_4'.
-    Returns (algorithm_name, group_key).
-    Group key is the size (e.g., '4').
+    Run baseline SAT solver and return (result, time, timed_out).
+    If timed out, result and time are None.
     """
-    # Match: mul_{algorithm}_{size} where algorithm can have underscores (e.g., pow2_m1)
-    match = re.match(r"^(mul_.+)_(\d+)$", filename)
-    if match:
-        algorithm = match.group(1)
-        size = match.group(2)
-        return algorithm, size
-    raise ValueError(f"Cannot parse multiplier filename: {filename}")
-
-
-def parse_sort_name(filename: str) -> tuple[str, str]:
-    """
-    Parse sorting circuit filename like 'BubbleSort_7_4'.
-    Returns (algorithm_name, group_key).
-    Group key is 'N_K' (e.g., '7_4').
-    """
-    # Match: {Algorithm}_{N}_{K}
-    match = re.match(r"^([A-Za-z]+)_(\d+)_(\d+)$", filename)
-    if match:
-        algorithm = match.group(1)
-        n = match.group(2)
-        k = match.group(3)
-        return algorithm, f"{n}_{k}"
-    raise ValueError(f"Cannot parse sort filename: {filename}")
-
-
-def detect_circuit_type(directory: Path) -> str:
-    """Detect the type of circuits in a directory based on file patterns."""
-    bench_files = list(directory.glob("mul_*.bench"))
-    aig_files = list(directory.glob("*Sort_*.aig"))
+    if timeout is not None:
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(timeout)
     
-    if bench_files and not aig_files:
-        return "multiplier"
-    elif aig_files and not bench_files:
-        return "sort"
-    elif bench_files and aig_files:
-        raise ValueError("Directory contains both multiplier and sort circuits. Please specify --type.")
-    else:
-        # Try to detect from any files present
-        all_bench = list(directory.glob("*.bench"))
-        all_aig = list(directory.glob("*.aig")) + list(directory.glob("*.aag"))
-        if all_bench:
-            return "multiplier"
-        elif all_aig:
-            return "sort"
-        raise ValueError("No circuit files found in directory.")
-
-
-def get_circuit_files(
-    directory: Path,
-    circuit_type: str,
-    group_filter: str | None = None,
-    prefixes: list[str] | None = None,
-) -> dict[str, list[Path]]:
-    """
-    Get circuit files grouped by their parameters.
-    
-    Returns a dict mapping group_key -> list of file paths.
-    For multipliers: group_key is the bit size (e.g., "4", "8")
-    For sort circuits: group_key is "N_K" (e.g., "7_4")
-    
-    Args:
-        directory: Path to the directory containing circuit files.
-        circuit_type: "multiplier" or "sort".
-        group_filter: If provided, only include groups matching this key.
-        prefixes: If provided, only include circuits with these algorithm prefixes.
-    """
-    groups: dict[str, list[Path]] = {}
-    
-    if circuit_type == "multiplier":
-        pattern = "*.bench"
-        parser = parse_multiplier_name
-    else:  # sort
-        pattern = "*.aig"
-        parser = parse_sort_name
-    
-    for file_path in sorted(directory.glob(pattern)):
-        try:
-            algorithm, group_key = parser(file_path.stem)
-        except ValueError:
-            continue  # Skip files that don't match expected pattern
-        
-        # Apply group filter
-        if group_filter is not None and group_key != group_filter:
-            continue
-        
-        # Apply prefix filter
-        if prefixes is not None and algorithm not in prefixes:
-            continue
-        
-        if group_key not in groups:
-            groups[group_key] = []
-        groups[group_key].append(file_path)
-    
-    return groups
-
-
-def run_baseline(miter: Circuit, solver_name: PySATSolverNames) -> tuple[bool, float]:
-    """Run baseline SAT solver and return (result, time)."""
-    t0 = time.time()
-    result = is_circuit_satisfiable(miter, solver_name=solver_name)
-    elapsed = time.time() - t0
-    return result.answer, elapsed
+    try:
+        t0 = time.time()
+        result = is_circuit_satisfiable(miter, solver_name=solver_name)
+        elapsed = time.time() - t0
+        return result.answer, elapsed, False
+    except SolverTimeout:
+        return None, None, True
+    finally:
+        if timeout is not None:
+            signal.alarm(0)
 
 
 def run_cnc(
     miter: Circuit,
     max_depth: int | None,
+    min_circuit_size: int | None,
     solver_name: PySATSolverNames,
-) -> tuple[bool, float, float, float, int]:
-    """Run CubeAndConquerSolver and return (result, cube_time, conquer_time, total_time, num_cubes)."""
-    # Deep copy to prevent CnC from mutating the original circuit
-    miter_copy = copy.deepcopy(miter)
-    solver = CubeAndConquerSolver(max_depth=max_depth, solver_name=solver_name)
+    timeout: int | None = None,
+) -> tuple[bool | None, float | None, float | None, float | None, int | None, bool]:
+    """
+    Run CubeAndConquerSolver and return (result, cube_time, conquer_time, total_time, num_cubes, timed_out).
+    If timed out, all values except timed_out are None.
+    """
+    if timeout is not None:
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(timeout)
     
-    t0 = time.time()
-    cubes = solver.cube(miter_copy)
-    t1 = time.time()
-    result = solver.conquer(cubes)
-    t2 = time.time()
-    
-    cube_time = t1 - t0
-    conquer_time = t2 - t1
-    total_time = t2 - t0
-    
-    return result.answer, cube_time, conquer_time, total_time, len(cubes)
+    try:
+        miter_copy = copy.deepcopy(miter)
+        solver = CubeAndConquerSolver(max_depth=max_depth, min_circuit_size=min_circuit_size, solver_name=solver_name)
+        
+        t0 = time.time()
+        cubes = solver.cube(miter_copy)
+        t1 = time.time()
+        result = solver.conquer(cubes)
+        t2 = time.time()
+        
+        cube_time = t1 - t0
+        conquer_time = t2 - t1
+        total_time = t2 - t0
+        
+        return result.answer, cube_time, conquer_time, total_time, len(cubes), False
+    except SolverTimeout:
+        return None, None, None, None, None, True
+    finally:
+        if timeout is not None:
+            signal.alarm(0)
 
 
-def generate_report(results: list[ExperimentResult], output_path: str, circuit_type: str) -> None:
+def generate_report(results: list[ExperimentResult], output_path: str) -> None:
     """Generate markdown report from experiment results."""
     with open(output_path, "w") as f:
-        title = "Multiplier" if circuit_type == "multiplier" else "Sorting Circuit"
-        f.write(f"# {title} Verification Experiment Report\n\n")
+        f.write("# Miter Verification Experiment Report\n\n")
         
         # Summary statistics
         total = len(results)
-        matches = sum(1 for r in results if r.match)
-        conquer_faster_count = sum(1 for r in results if r.conquer_faster)
+        baseline_timeouts = sum(1 for r in results if r.baseline_timed_out)
+        cnc_timeouts = sum(1 for r in results if r.cnc_timed_out)
+        completed = [r for r in results if not r.baseline_timed_out and not r.cnc_timed_out]
+        matches = sum(1 for r in completed if r.match)
+        conquer_faster_count = sum(1 for r in completed if r.conquer_faster)
         
         f.write("## Summary\n\n")
-        f.write(f"- **Total comparisons:** {total}\n")
-        f.write(f"- **Results matching:** {matches}/{total}\n")
-        f.write(f"- **Conquer faster than baseline:** {conquer_faster_count}/{total} ({100*conquer_faster_count/total:.1f}%)\n\n")
+        f.write(f"- **Total runs:** {total}\n")
+        f.write(f"- **Baseline timeouts:** {baseline_timeouts}\n")
+        f.write(f"- **CnC timeouts:** {cnc_timeouts}\n")
+        if completed:
+            f.write(f"- **Results matching:** {matches}/{len(completed)}\n")
+            f.write(f"- **Conquer faster than baseline:** {conquer_faster_count}/{len(completed)} ({100*conquer_faster_count/len(completed):.1f}%)\n\n")
         
-        if matches != total:
+        if completed and matches != len(completed):
             f.write("⚠️ **WARNING: Some results do not match!**\n\n")
         
         # Detailed results table
         f.write("## Detailed Results\n\n")
-        f.write("| Circuit 1 | Circuit 2 | depth | Baseline | **Conquer** | Faster? | Cube | Total | Cubes | Match |\n")
-        f.write("|-----------|-----------|-------|----------|-------------|---------|------|-------|-------|-------|\n")
+        f.write("| Miter | depth | min_size | Baseline | **Conquer** | Faster? | Cube | Total | Cubes | Match |\n")
+        f.write("|-------|-------|----------|----------|-------------|---------|------|-------|-------|-------|\n")
         
         for r in results:
             depth_str = str(r.max_depth) if r.max_depth is not None else "None"
-            faster_mark = "**✓**" if r.conquer_faster else ""
-            match_mark = "✓" if r.match else "❌"
+            min_size_str = str(r.min_circuit_size) if r.min_circuit_size is not None else "None"
+            
+            # Format baseline
+            if r.baseline_timed_out:
+                baseline_str = "TIMEOUT"
+            else:
+                baseline_str = f"{r.baseline_time:.4f}"
+            
+            # Format CnC
+            if r.cnc_timed_out:
+                cnc_str = "TIMEOUT"
+                cube_str = "-"
+                total_str = "-"
+                cubes_str = "-"
+            else:
+                cnc_str = f"**{r.cnc_conquer_time:.4f}**"
+                cube_str = f"{r.cnc_cube_time:.4f}"
+                total_str = f"{r.cnc_total_time:.4f}"
+                cubes_str = str(r.cnc_cubes)
+            
+            # Format comparison columns
+            if r.baseline_timed_out or r.cnc_timed_out:
+                faster_mark = "-"
+                match_mark = "-"
+            else:
+                faster_mark = "**✓**" if r.conquer_faster else ""
+                match_mark = "✓" if r.match else "❌"
             
             f.write(
-                f"| {r.circuit1_name} | {r.circuit2_name} | {depth_str} | "
-                f"{r.baseline_time:.4f} | **{r.cnc_conquer_time:.4f}** | {faster_mark} | "
-                f"{r.cnc_cube_time:.4f} | {r.cnc_total_time:.4f} | "
-                f"{r.cnc_cubes} | {match_mark} |\n"
+                f"| {r.miter_name} | {depth_str} | {min_size_str} | "
+                f"{baseline_str} | {cnc_str} | {faster_mark} | "
+                f"{cube_str} | {total_str} | {cubes_str} | {match_mark} |\n"
             )
         
-        # Best configurations
-        f.write("\n## Best Configurations\n\n")
-        
-        if conquer_faster_count > 0:
-            # Group by (max_depth, solver_name) and count wins
-            config_wins: dict[tuple[int | None, str], int] = {}
-            for r in results:
-                if r.conquer_faster:
-                    key = (r.max_depth, r.solver_name)
-                    config_wins[key] = config_wins.get(key, 0) + 1
-            
-            sorted_configs = sorted(config_wins.items(), key=lambda x: -x[1])
-            f.write("| max_depth | solver | Wins |\n")
-            f.write("|-----------|--------|------|\n")
-            for (depth, solver), wins in sorted_configs[:5]:
-                depth_str = str(depth) if depth is not None else "None"
-                f.write(f"| {depth_str} | {solver} | {wins} |\n")
-        else:
-            f.write("No configurations where conquer was faster than baseline.\n")
-        
         # Speedup analysis
-        f.write("\n## Speedup Analysis\n\n")
-        if results:
-            # Speedup based on conquer time vs baseline
-            conquer_speedups = [r.baseline_time / r.cnc_conquer_time if r.cnc_conquer_time > 0 else 0 for r in results]
+        if completed:
+            f.write("\n## Speedup Analysis\n\n")
+            conquer_speedups = [r.baseline_time / r.cnc_conquer_time if r.cnc_conquer_time > 0 else 0 for r in completed]
             avg_conquer_speedup = sum(conquer_speedups) / len(conquer_speedups)
             max_conquer_speedup = max(conquer_speedups)
             
-            # Speedup based on total time vs baseline
-            total_speedups = [r.baseline_time / r.cnc_total_time if r.cnc_total_time > 0 else 0 for r in results]
+            total_speedups = [r.baseline_time / r.cnc_total_time if r.cnc_total_time > 0 else 0 for r in completed]
             avg_total_speedup = sum(total_speedups) / len(total_speedups)
             max_total_speedup = max(total_speedups)
             
@@ -254,199 +210,220 @@ def generate_report(results: list[ExperimentResult], output_path: str, circuit_t
             f.write(f"- **Max total speedup:** {max_total_speedup:.2f}x\n")
 
 
+def run_single_miter_experiment(
+    miter_path: Path,
+    max_depths: list[int | None],
+    min_circuit_sizes: list[int | None],
+    solver_names: list[PySATSolverNames],
+    timeout: int | None = None,
+) -> list[ExperimentResult]:
+    """Run experiment for a single miter circuit. Returns results list."""
+    name = miter_path.name
+    
+    print(f"Loading {name}...")
+    miter = load_circuit(miter_path)
+    print(f"Miter size: {miter.size} gates, {miter.input_size} inputs")
+    miter = Transformer.apply_transformers(
+        miter,
+        [
+            RemoveConstantGates(),
+            # RemoveRedundantGates(),
+            # MergeUnaryOperators(),
+            # MergeDuplicateGates(),
+        ]
+    )
+    print(f"Miter size: {miter.size} gates, {miter.input_size} inputs (after trivial simplification)")
+
+    results: list[ExperimentResult] = []
+    
+    for solver_name in solver_names:
+        # Run baseline with timeout
+        baseline_result, baseline_time, baseline_timed_out = run_baseline(miter, solver_name, timeout)
+        
+        if baseline_timed_out:
+            print(f"Baseline ({solver_name.value}): TIMEOUT")
+        else:
+            print(f"Baseline ({solver_name.value}): {'SAT' if baseline_result else 'UNSAT'} in {baseline_time:.4f}s")
+
+        for max_depth in max_depths:
+            for min_circuit_size in min_circuit_sizes:
+                # Run CnC with timeout
+                cnc_result, cube_time, conquer_time, total_time, cnc_cubes, cnc_timed_out = run_cnc(
+                    miter, max_depth, min_circuit_size, solver_name, timeout
+                )
+                
+                depth_str = str(max_depth) if max_depth is not None else "None"
+                min_size_str = str(min_circuit_size) if min_circuit_size is not None else "None"
+                
+                if cnc_timed_out:
+                    print(f"  CnC (depth={depth_str}, min_size={min_size_str}): TIMEOUT")
+                    match = None
+                    conquer_faster = None
+                else:
+                    if baseline_timed_out:
+                        match = None
+                        conquer_faster = None
+                    else:
+                        match = baseline_result == cnc_result
+                        conquer_faster = conquer_time < baseline_time
+                    
+                    status = "✓" if match else ("MISMATCH!" if match is False else "?")
+                    faster = " (conquer faster)" if conquer_faster else ""
+                    print(f"  CnC (depth={depth_str}, min_size={min_size_str}): {'SAT' if cnc_result else 'UNSAT'} cube={cube_time:.4f}s conquer={conquer_time:.4f}s total={total_time:.4f}s, {cnc_cubes} cubes {status}{faster}")
+
+                results.append(ExperimentResult(
+                    miter_name=name,
+                    baseline_result=baseline_result,
+                    baseline_time=baseline_time,
+                    baseline_timed_out=baseline_timed_out,
+                    cnc_result=cnc_result,
+                    cnc_cube_time=cube_time,
+                    cnc_conquer_time=conquer_time,
+                    cnc_total_time=total_time,
+                    cnc_cubes=cnc_cubes,
+                    cnc_timed_out=cnc_timed_out,
+                    max_depth=max_depth,
+                    min_circuit_size=min_circuit_size,
+                    solver_name=solver_name.value,
+                    match=match,
+                    conquer_faster=conquer_faster,
+                ))
+
+                if match is False:
+                    print(f"  ⚠️ WARNING: Results do not match!")
+    
+    return results
+
+
 def run_experiment(
-    directory: str,
-    circuit_type: str | None,
+    miters: list[str],
     output: str,
     max_depths: list[int | None],
+    min_circuit_sizes: list[int | None],
     solver_names: list[PySATSolverNames],
-    group_filter: str | None = None,
-    prefixes: list[str] | None = None,
+    timeout: int | None = None,
 ) -> list[ExperimentResult]:
-    """Run the full experiment."""
+    """Run experiments for all miter circuits."""
     
-    dir_path = Path(directory)
+    # Validate all paths first
+    validated_miters: list[Path] = []
+    for miter_path in miters:
+        path = Path(miter_path)
+        
+        if not path.exists():
+            print(f"Error: Miter file not found: {path}")
+            sys.exit(1)
+        
+        validated_miters.append(path)
     
-    # Auto-detect circuit type if not specified
-    if circuit_type is None:
-        circuit_type = detect_circuit_type(dir_path)
-        print(f"Auto-detected circuit type: {circuit_type}")
-    
-    # Get grouped circuit files
-    groups = get_circuit_files(dir_path, circuit_type, group_filter, prefixes)
-    
-    if not groups:
-        print(f"No circuit files found in {directory}")
-        return []
+    if timeout is not None:
+        print(f"Per-solver timeout: {timeout} seconds")
     
     all_results: list[ExperimentResult] = []
     
-    for group_key in sorted(groups.keys(), key=lambda x: (len(x), x)):
-        files = groups[group_key]
-        
-        if len(files) < 2:
-            print(f"Skipping group '{group_key}': need at least 2 circuits, found {len(files)}")
-            continue
-        
+    for i, path in enumerate(validated_miters):
         print(f"\n{'='*60}")
-        print(f"Running experiments for group: {group_key}")
+        print(f"Miter {i+1}/{len(validated_miters)}: {path.name}")
         print(f"{'='*60}")
         
-        print(f"Found {len(files)} circuits:")
-        for f in files:
-            print(f"  - {f.name}")
-        
-        # Load circuits
-        circuits: dict[str, Circuit] = {}
-        for file_path in files:
-            name = file_path.stem
-            print(f"Loading {name}...")
-            circuits[name] = load_circuit(file_path)
-        
-        # Generate pairs
-        pairs = list(itertools.combinations(circuits.keys(), 2))
-        print(f"\nComparing {len(pairs)} circuit pairs")
-        
-        for i, (name1, name2) in enumerate(pairs):
-            print(f"\n[{i+1}/{len(pairs)}] Comparing {name1} vs {name2}")
-            
-            c1 = circuits[name1]
-            c2 = circuits[name2]
-            
-            # Build miter and convert to AIG
-            miter = build_miter(c1, c2)
-            miter.into_aig()
-
-            print(f"  Miter size: {miter.size} gates, {miter.input_size} inputs")
-
-            for solver_name in solver_names:
-                # Run baseline once per solver
-                baseline_result, baseline_time = run_baseline(miter, solver_name)
-                print(f"  Baseline ({solver_name.value}): {'SAT' if baseline_result else 'UNSAT'} in {baseline_time:.4f}s")
-
-                for max_depth in max_depths:
-                    cnc_result, cube_time, conquer_time, total_time, cnc_cubes = run_cnc(miter, max_depth, solver_name)
-
-                    match = baseline_result == cnc_result
-                    conquer_faster = conquer_time < baseline_time
-
-                    depth_str = str(max_depth) if max_depth is not None else "None"
-                    status = "✓" if match else "MISMATCH!"
-                    faster = " (conquer faster)" if conquer_faster else ""
-                    print(f"    CnC (depth={depth_str}): {'SAT' if cnc_result else 'UNSAT'} cube={cube_time:.4f}s conquer={conquer_time:.4f}s total={total_time:.4f}s, {cnc_cubes} cubes {status}{faster}")
-
-                    all_results.append(ExperimentResult(
-                        circuit1_name=name1,
-                        circuit2_name=name2,
-                        baseline_result=baseline_result,
-                        baseline_time=baseline_time,
-                        cnc_result=cnc_result,
-                        cnc_cube_time=cube_time,
-                        cnc_conquer_time=conquer_time,
-                        cnc_total_time=total_time,
-                        cnc_cubes=cnc_cubes,
-                        max_depth=max_depth,
-                        solver_name=solver_name.value,
-                        match=match,
-                        conquer_faster=conquer_faster,
-                    ))
-
-                    if not match:
-                        print(f"    ⚠️ WARNING: Results do not match!")
+        miter_results = run_single_miter_experiment(path, max_depths, min_circuit_sizes, solver_names, timeout)
+        all_results.extend(miter_results)
     
     # Generate report
     if all_results:
-        generate_report(all_results, output, circuit_type)
+        generate_report(all_results, output)
         print(f"\nReport written to {output}")
         
-        # Final summary
-        total_matches = sum(1 for r in all_results if r.match)
-        total_faster = sum(1 for r in all_results if r.conquer_faster)
-        print(f"\nFinal: {total_matches}/{len(all_results)} matches, {total_faster}/{len(all_results)} conquer faster than baseline")
+        completed = [r for r in all_results if not r.baseline_timed_out and not r.cnc_timed_out]
+        if completed:
+            total_matches = sum(1 for r in completed if r.match)
+            total_faster = sum(1 for r in completed if r.conquer_faster)
+            print(f"Final: {total_matches}/{len(completed)} matches, {total_faster}/{len(completed)} conquer faster than baseline")
     
     return all_results
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compare baseline SAT vs CubeAndConquerSolver on circuit verification"
+        description="Compare baseline SAT vs CubeAndConquerSolver on miter verification"
     )
     parser.add_argument(
-        "--directory", "-d",
+        "--input", "-i",
         type=str,
-        default="aig_output",
-        help="Directory containing circuit files (default: aig_output)"
-    )
-    parser.add_argument(
-        "--type", "-t",
-        type=str,
-        choices=["multiplier", "sort"],
-        default=None,
-        help="Circuit type: 'multiplier' for .bench files, 'sort' for .aig files (auto-detected if not specified)"
-    )
-    parser.add_argument(
-        "--group", "-g",
-        type=str,
-        default=None,
-        help="Filter to specific group (e.g., '4' for 4-bit multipliers, '7_4' for 7-element 4-bit sort)"
-    )
-    parser.add_argument(
-        "--pair", "-p",
-        type=str,
-        nargs=2,
-        metavar=("PREFIX1", "PREFIX2"),
-        help="Circuit pair prefixes to compare (e.g., --pair mul_alter mul_dadda or --pair BubbleSort PancakeSort)"
+        action="append",
+        metavar="MITER",
+        required=True,
+        help="A miter circuit file to check (.bench, .aig, or .aag). Can be specified multiple times."
     )
     parser.add_argument(
         "--output", "-o",
         type=str,
-        default="experiment_report.md",
-        help="Output report path (default: experiment_report.md)"
-    )
-    # Legacy arguments for backwards compatibility
-    parser.add_argument(
-        "--min-size",
-        type=int,
-        default=None,
-        help="[Deprecated] Use --group instead. Minimum multiplier bit size."
+        required=True,
+        help="Output report path (example: experiment_report.md)"
     )
     parser.add_argument(
-        "--max-size",
+        "--timeout", "-t",
         type=int,
         default=None,
-        help="[Deprecated] Use --group instead. Maximum multiplier bit size."
+        help="Timeout in seconds per solver call (default: no timeout)"
     )
-    
+    parser.add_argument(
+        "--depths", "-d",
+        type=str,
+        default=None,
+        help="Comma-separated list of max depths to test (use 'None' for unlimited). Example: '1,2,5' (default: None)"
+    )
+    parser.add_argument(
+        "--min-sizes", "-m",
+        type=str,
+        default="1",
+        help="Comma-separated list of min circuit sizes to test (use 'None' for no limit). Example: '100,500' (default: 1)"
+    )
+
     args = parser.parse_args()
     
-    # Handle legacy min/max-size arguments
-    group_filter = args.group
-    if args.min_size is not None or args.max_size is not None:
-        print("Warning: --min-size and --max-size are deprecated. Use --group instead.")
-        # If using legacy args without --group, we need to run for multiple groups
-        # For now, just ignore them if --group is set
-        if group_filter is None and args.min_size is not None:
-            group_filter = str(args.min_size)
+    # Parse depths
+    max_depths: list[int | None] = []
+    if args.depths is None:
+        max_depths.append(None)
+    else:
+        for d in args.depths.split(","):
+            d = d.strip()
+            if d.lower() == "none":
+                max_depths.append(None)
+            else:
+                max_depths.append(int(d))
+    
+    # Parse min circuit sizes
+    min_circuit_sizes: list[int | None] = []
+    for s in args.min_sizes.split(","):
+        s = s.strip()
+        if s.lower() == "none":
+            min_circuit_sizes.append(None)
+        else:
+            min_circuit_sizes.append(int(s))
+    
+    # Get input miters list
+    miters = args.input
+    
+    print(f"Running {len(miters)} miter(s):")
+    for i, m in enumerate(miters):
+        print(f"  {i+1}. {m}")
+    print(f"Depths: {max_depths}")
+    print(f"Min circuit sizes: {min_circuit_sizes}")
     
     # Configuration
-    max_depths: list[int | None] = [1, 2, 5]
     solver_names = [
         PySATSolverNames.CADICAL195,
-        # PySATSolverNames.GLUCOSE4,
-        # PySATSolverNames.MINISAT22,
     ]
     
-    # Get prefixes from pair argument if provided
-    prefixes = list(args.pair) if args.pair else None
-    
     run_experiment(
-        directory=args.directory,
-        circuit_type=args.type,
+        miters=miters,
         output=args.output,
         max_depths=max_depths,
+        min_circuit_sizes=min_circuit_sizes,
         solver_names=solver_names,
-        group_filter=group_filter,
-        prefixes=prefixes,
+        timeout=args.timeout,
     )
 
 

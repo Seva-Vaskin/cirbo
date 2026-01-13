@@ -2,7 +2,7 @@ import collections
 import copy
 import typing as tp
 
-from cirbo.core.circuit import Circuit, ALWAYS_TRUE, ALWAYS_FALSE
+from cirbo.core.circuit import Circuit, ALWAYS_TRUE, ALWAYS_FALSE, INPUT, AND, NOT
 from cirbo.sat import PySatResult, Cnf, is_satisfiable, PySATSolverNames
 from cirbo.sat.solver.circuit_sat_instance import CircuitSatInstance, AssignmentStatus
 
@@ -12,9 +12,11 @@ class CubeAndConquerSolver:
     def __init__(
         self,
         max_depth: int | None = None,
+        min_circuit_size: int | None = None,
         solver_name: PySATSolverNames = PySATSolverNames.CADICAL195,
     ):
         self.max_depth = max_depth
+        self.min_circuit_size = min_circuit_size
         self.solver_name = solver_name
 
     def solve(self, circuit: Circuit) -> PySatResult:
@@ -50,7 +52,7 @@ class CubeAndConquerSolver:
         if trivial_assignment_status != AssignmentStatus.OK:
             return []
 
-        if self._check_stop_cube(instance) or (self.max_depth is not None and depth >= self.max_depth):
+        if self._check_stop_cube(instance, depth):
             return [instance]
 
         cube_gate = self._select_cube_gate(instance)
@@ -88,10 +90,15 @@ class CubeAndConquerSolver:
         assert best_gate_label is not None
         return best_gate_label
 
-    @staticmethod
-    def _check_stop_cube(instance: CircuitSatInstance) -> bool:
-        # TODO: Refine stop criteria
-        return instance.circuit.input_size == 0
+    def _check_stop_cube(self, instance: CircuitSatInstance, depth: int) -> bool:
+        # TODO: when to stop?
+        if instance.circuit.input_size == 0:
+            return True
+        if self.max_depth is not None and depth >= self.max_depth: # reached max depth
+            return True
+        if self.min_circuit_size is not None and instance.circuit.size <= self.min_circuit_size: # reached min circuit size
+            return True
+        return False
 
     def _solve_instance(self, instance: CircuitSatInstance) -> PySatResult:
         """Solve a cube instance and return the full SAT result."""
@@ -100,6 +107,6 @@ class CubeAndConquerSolver:
             solver_name=self.solver_name,
         )
 
-    def is_sat(self, instance: CircuitSatInstance) -> bool:
-        """Check if a cube instance is satisfiable."""
-        return self._solve_instance(instance).answer
+    # def is_sat(self, instance: CircuitSatInstance) -> bool:
+    #     """Check if a cube instance is satisfiable."""
+    #     return self._solve_instance(instance).answer
