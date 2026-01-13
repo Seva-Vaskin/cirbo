@@ -13,6 +13,7 @@ __all__ = [
     'RemoveConstantGates',
 ]
 
+from cirbo.minimization.simplification.merge_unary_operators import MergeUnaryOperators
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +106,10 @@ class RemoveConstantGates(Transformer):
     __idempotent__: bool = True
 
     def __init__(self):
-        super().__init__(post_transformers=(RemoveRedundantGates(),))
+        super().__init__(post_transformers=(
+            MergeUnaryOperators(),
+            RemoveRedundantGates()
+        ))
 
     def _transform(self, circuit: Circuit) -> Circuit:
         """
