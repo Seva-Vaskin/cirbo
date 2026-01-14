@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from cirbo.core.circuit import Circuit, INPUT, Transformer
 from cirbo.core.circuit.gate import NOT, AND, ALWAYS_FALSE, ALWAYS_TRUE, Gate
-from cirbo.minimization import RemoveRedundantGates
+from cirbo.minimization import RemoveRedundantGates, MergeUnaryOperators
 from cirbo.minimization.simplification.remove_constant_gates import RemoveConstantGates
 from cirbo.sat import PySatResult, tseytin_transformation, Cnf, is_satisfiable, PySATSolverNames
 
@@ -83,9 +83,15 @@ class CircuitSatInstance:
         return instance
 
     def simplify(self):
+        # print(f"Simplify before {self.circuit.size}")
         self.circuit = Transformer.apply_transformers(self.circuit, [
             RemoveConstantGates(),
         ])
+        # print(f"Simplify after const elimination {self.circuit.size}")
+        # self.circuit = Transformer.apply_transformers(self.circuit, [
+        #     MergeUnaryOperators(),
+        # ])
+        # print(f"Simplify after merge unary gates {self.circuit.size}")
 
     def assign(self, label: str, value: bool) -> AssignmentStatus:
         assignment_status = self._assign_and_propagate(label, value)
@@ -110,35 +116,24 @@ class CircuitSatInstance:
                 return AssignmentStatus.CONFLICT
             return AssignmentStatus.OK
 
+        # Add unit clause to fix the gate value in the CNF
+        lit = self.gates_config[label].idx
+        self.cnf.add_clause([lit if value else -lit])
+
         if gate.gate_type == INPUT:
             inputs_to_true, inputs_to_false = [], []
             (inputs_to_true if value else inputs_to_false).append(label)
             self.circuit = self.circuit.replace_inputs(inputs_to_true, inputs_to_false)
             self.gates_config[label].value = value
-            # Add unit clause to fix the input value in the CNF
-            lit = self.gates_config[label].idx
-            self.cnf.add_clause([lit if value else -lit])
             return AssignmentStatus.OK
 
-        # unattach users
-        is_output = label in self.circuit.outputs
         for operand in gate.operands:
             self.circuit._remove_user(gate_label=operand, user=label)
-            if (
-                    True
-                    and is_output
-                    and len(self.circuit.get_gate_users(operand)) == 0
-                    and operand not in self.circuit.outputs
-            ):
-                self.circuit._outputs.append(operand)
 
         # change gate to const
-        if label in self.circuit.outputs:
-            self.circuit.remove_gate(label)
-        else:
-            new_gate_type = ALWAYS_TRUE if value else ALWAYS_FALSE
-            new_gate = Gate(label=label, gate_type=new_gate_type, operands=())
-            self.circuit._gates[label] = new_gate
+        new_gate_type = ALWAYS_TRUE if value else ALWAYS_FALSE
+        new_gate = Gate(label=label, gate_type=new_gate_type, operands=())
+        self.circuit._gates[label] = new_gate
 
         if gate.gate_type == NOT:
             return self._assign_and_propagate(gate.operands[0], not value)

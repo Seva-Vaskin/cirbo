@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import copy
+import logging
 import signal
 import sys
 import time
@@ -50,6 +51,7 @@ class ExperimentResult:
     cnc_timed_out: bool
     max_depth: int | None
     min_circuit_size: int | None
+    candidates_limit: int | None
     solver_name: str
     match: bool | None
     conquer_faster: bool | None
@@ -95,6 +97,7 @@ def run_cnc(
     miter: Circuit,
     max_depth: int | None,
     min_circuit_size: int | None,
+    candidates_limit: int | None,
     solver_name: PySATSolverNames,
     timeout: int | None = None,
 ) -> tuple[bool | None, float | None, float | None, float | None, int | None, bool]:
@@ -108,7 +111,12 @@ def run_cnc(
     
     try:
         miter_copy = copy.deepcopy(miter)
-        solver = CubeAndConquerSolver(max_depth=max_depth, min_circuit_size=min_circuit_size, solver_name=solver_name)
+        solver = CubeAndConquerSolver(
+            max_depth=max_depth,
+            min_circuit_size=min_circuit_size,
+            solver_name=solver_name,
+            candidates_limit=candidates_limit,
+        )
         
         t0 = time.time()
         cubes = solver.cube(miter_copy)
@@ -154,12 +162,13 @@ def generate_report(results: list[ExperimentResult], output_path: str) -> None:
         
         # Detailed results table
         f.write("## Detailed Results\n\n")
-        f.write("| Miter | depth | min_size | Baseline | **Conquer** | Faster? | Cube | Total | Cubes | Match |\n")
-        f.write("|-------|-------|----------|----------|-------------|---------|------|-------|-------|-------|\n")
+        f.write("| Miter | depth | min_size | candidates | Baseline | **Conquer** | Faster? | Cube | Total | Cubes | Match |\n")
+        f.write("|-------|-------|----------|------------|----------|-------------|---------|------|-------|-------|-------|\n")
         
         for r in results:
             depth_str = str(r.max_depth) if r.max_depth is not None else "None"
             min_size_str = str(r.min_circuit_size) if r.min_circuit_size is not None else "None"
+            candidates_str = str(r.candidates_limit) if r.candidates_limit is not None else "None"
             
             # Format baseline
             if r.baseline_timed_out:
@@ -188,7 +197,7 @@ def generate_report(results: list[ExperimentResult], output_path: str) -> None:
                 match_mark = "✓" if r.match else "❌"
             
             f.write(
-                f"| {r.miter_name} | {depth_str} | {min_size_str} | "
+                f"| {r.miter_name} | {depth_str} | {min_size_str} | {candidates_str} | "
                 f"{baseline_str} | {cnc_str} | {faster_mark} | "
                 f"{cube_str} | {total_str} | {cubes_str} | {match_mark} |\n"
             )
@@ -214,6 +223,7 @@ def run_single_miter_experiment(
     miter_path: Path,
     max_depths: list[int | None],
     min_circuit_sizes: list[int | None],
+    candidates_limits: list[int | None],
     solver_names: list[PySATSolverNames],
     timeout: int | None = None,
 ) -> list[ExperimentResult]:
@@ -228,7 +238,7 @@ def run_single_miter_experiment(
         [
             RemoveConstantGates(),
             # RemoveRedundantGates(),
-            # MergeUnaryOperators(),
+            MergeUnaryOperators(),
             # MergeDuplicateGates(),
         ]
     )
@@ -247,50 +257,53 @@ def run_single_miter_experiment(
 
         for max_depth in max_depths:
             for min_circuit_size in min_circuit_sizes:
-                # Run CnC with timeout
-                cnc_result, cube_time, conquer_time, total_time, cnc_cubes, cnc_timed_out = run_cnc(
-                    miter, max_depth, min_circuit_size, solver_name, timeout
-                )
-                
-                depth_str = str(max_depth) if max_depth is not None else "None"
-                min_size_str = str(min_circuit_size) if min_circuit_size is not None else "None"
-                
-                if cnc_timed_out:
-                    print(f"  CnC (depth={depth_str}, min_size={min_size_str}): TIMEOUT")
-                    match = None
-                    conquer_faster = None
-                else:
-                    if baseline_timed_out:
+                for candidates_limit in candidates_limits:
+                    # Run CnC with timeout
+                    cnc_result, cube_time, conquer_time, total_time, cnc_cubes, cnc_timed_out = run_cnc(
+                        miter, max_depth, min_circuit_size, candidates_limit, solver_name, timeout
+                    )
+                    
+                    depth_str = str(max_depth) if max_depth is not None else "None"
+                    min_size_str = str(min_circuit_size) if min_circuit_size is not None else "None"
+                    candidates_str = str(candidates_limit) if candidates_limit is not None else "None"
+                    
+                    if cnc_timed_out:
+                        print(f"  CnC (depth={depth_str}, min_size={min_size_str}, cand={candidates_str}): TIMEOUT")
                         match = None
                         conquer_faster = None
                     else:
-                        match = baseline_result == cnc_result
-                        conquer_faster = conquer_time < baseline_time
-                    
-                    status = "✓" if match else ("MISMATCH!" if match is False else "?")
-                    faster = " (conquer faster)" if conquer_faster else ""
-                    print(f"  CnC (depth={depth_str}, min_size={min_size_str}): {'SAT' if cnc_result else 'UNSAT'} cube={cube_time:.4f}s conquer={conquer_time:.4f}s total={total_time:.4f}s, {cnc_cubes} cubes {status}{faster}")
+                        if baseline_timed_out:
+                            match = None
+                            conquer_faster = None
+                        else:
+                            match = baseline_result == cnc_result
+                            conquer_faster = conquer_time < baseline_time
+                        
+                        status = "✓" if match else ("MISMATCH!" if match is False else "?")
+                        faster = " (conquer faster)" if conquer_faster else ""
+                        print(f"  CnC (depth={depth_str}, min_size={min_size_str}, cand={candidates_str}): {'SAT' if cnc_result else 'UNSAT'} cube={cube_time:.4f}s conquer={conquer_time:.4f}s total={total_time:.4f}s, {cnc_cubes} cubes {status}{faster}")
 
-                results.append(ExperimentResult(
-                    miter_name=name,
-                    baseline_result=baseline_result,
-                    baseline_time=baseline_time,
-                    baseline_timed_out=baseline_timed_out,
-                    cnc_result=cnc_result,
-                    cnc_cube_time=cube_time,
-                    cnc_conquer_time=conquer_time,
-                    cnc_total_time=total_time,
-                    cnc_cubes=cnc_cubes,
-                    cnc_timed_out=cnc_timed_out,
-                    max_depth=max_depth,
-                    min_circuit_size=min_circuit_size,
-                    solver_name=solver_name.value,
-                    match=match,
-                    conquer_faster=conquer_faster,
-                ))
+                    results.append(ExperimentResult(
+                        miter_name=name,
+                        baseline_result=baseline_result,
+                        baseline_time=baseline_time,
+                        baseline_timed_out=baseline_timed_out,
+                        cnc_result=cnc_result,
+                        cnc_cube_time=cube_time,
+                        cnc_conquer_time=conquer_time,
+                        cnc_total_time=total_time,
+                        cnc_cubes=cnc_cubes,
+                        cnc_timed_out=cnc_timed_out,
+                        max_depth=max_depth,
+                        min_circuit_size=min_circuit_size,
+                        candidates_limit=candidates_limit,
+                        solver_name=solver_name.value,
+                        match=match,
+                        conquer_faster=conquer_faster,
+                    ))
 
-                if match is False:
-                    print(f"  ⚠️ WARNING: Results do not match!")
+                    if match is False:
+                        print(f"  ⚠️ WARNING: Results do not match!")
     
     return results
 
@@ -300,6 +313,7 @@ def run_experiment(
     output: str,
     max_depths: list[int | None],
     min_circuit_sizes: list[int | None],
+    candidates_limits: list[int | None],
     solver_names: list[PySATSolverNames],
     timeout: int | None = None,
 ) -> list[ExperimentResult]:
@@ -326,7 +340,7 @@ def run_experiment(
         print(f"Miter {i+1}/{len(validated_miters)}: {path.name}")
         print(f"{'='*60}")
         
-        miter_results = run_single_miter_experiment(path, max_depths, min_circuit_sizes, solver_names, timeout)
+        miter_results = run_single_miter_experiment(path, max_depths, min_circuit_sizes, candidates_limits, solver_names, timeout)
         all_results.extend(miter_results)
     
     # Generate report
@@ -380,7 +394,23 @@ def main():
         help="Comma-separated list of min circuit sizes to test (use 'None' for no limit). Example: '100,500' (default: 1)"
     )
 
+    parser.add_argument(
+        "--candidates", "-c",
+        type=str,
+        default=None,
+        help="Comma-separated list of candidate limits to test (use 'None' for all). Example: '10,50' (default: None)"
+    )
+
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+    )
+
     args = parser.parse_args()
+
+    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    logging.basicConfig(level=log_level, format="%(levelname)s: %(message)s")
     
     # Parse depths
     max_depths: list[int | None] = []
@@ -402,6 +432,18 @@ def main():
             min_circuit_sizes.append(None)
         else:
             min_circuit_sizes.append(int(s))
+            
+    # Parse candidates limits
+    candidates_limits: list[int | None] = []
+    if args.candidates is None:
+        candidates_limits.append(None)
+    else:
+        for c in args.candidates.split(","):
+            c = c.strip()
+            if c.lower() == "none":
+                candidates_limits.append(None)
+            else:
+                candidates_limits.append(int(c))
     
     # Get input miters list
     miters = args.input
@@ -411,6 +453,7 @@ def main():
         print(f"  {i+1}. {m}")
     print(f"Depths: {max_depths}")
     print(f"Min circuit sizes: {min_circuit_sizes}")
+    print(f"Candidates limits: {candidates_limits}")
     
     # Configuration
     solver_names = [
@@ -422,6 +465,7 @@ def main():
         output=args.output,
         max_depths=max_depths,
         min_circuit_sizes=min_circuit_sizes,
+        candidates_limits=candidates_limits,
         solver_names=solver_names,
         timeout=args.timeout,
     )
