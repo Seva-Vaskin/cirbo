@@ -1,13 +1,36 @@
-import collections
 import copy
 import logging
-import typing as tp
+from dataclasses import dataclass
 
 from cirbo.core.circuit import Circuit, ALWAYS_TRUE, ALWAYS_FALSE, INPUT, AND, NOT
-from cirbo.sat import PySatResult, Cnf, is_satisfiable, PySATSolverNames
+from cirbo.sat import PySatResult, is_satisfiable, PySATSolverNames
 from cirbo.sat.solver.circuit_sat_instance import CircuitSatInstance, AssignmentStatus
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class GateWeightResult:
+    """Result of weighting a gate for cube selection."""
+    weight: int | None = None
+    forced_value: bool | None = None
+
+    @property
+    def is_forced(self) -> bool:
+        """Returns True if one branch leads to conflict, forcing the other value."""
+        return self.forced_value is not None
+
+
+@dataclass
+class CubeGateSelection:
+    """Result of selecting a gate for cube splitting."""
+    label: str
+    forced_value: bool | None = None
+
+    @property
+    def is_forced(self) -> bool:
+        """Returns True if this gate must take a specific value."""
+        return self.forced_value is not None
 
 
 class CubeAndConquerSolver:
@@ -18,11 +41,13 @@ class CubeAndConquerSolver:
         min_circuit_size: int | None = None,
         solver_name: PySATSolverNames = PySATSolverNames.CADICAL195,
         candidates_limit: int | None = None,
+        score_threshold: float | None = None,
     ):
         self.max_depth = max_depth
         self.min_circuit_size = min_circuit_size
         self.solver_name = solver_name
         self.candidates_limit = candidates_limit
+        self.score_threshold = score_threshold
 
     def solve(self, circuit: Circuit) -> PySatResult:
         cubes = self.cube(circuit)
@@ -57,10 +82,7 @@ class CubeAndConquerSolver:
                 return PySatResult(answer=True, model=model)
         return PySatResult(answer=False, model=None)
 
-    def _cube(self, instance: CircuitSatInstance, depth: int = 0) -> tp.List[CircuitSatInstance]:
-        # trivial_assignment_status = instance.apply_trivial_assignments()
-        # if trivial_assignment_status != AssignmentStatus.OK:
-        #     return []
+    def _cube(self, instance: CircuitSatInstance, depth: int = 0) -> list[CircuitSatInstance]:
         logger.info(f"Try cube. Depth {depth}, Circuit: {instance.circuit.size}, Cnf: {len(instance.cnf.get_raw())}")
 
         if self._check_stop_cube(instance, depth):
@@ -68,64 +90,60 @@ class CubeAndConquerSolver:
             return [instance]
 
         logger.info("Selecting cube gate...")
-        cube_gate_dict = self._select_cube_gate(instance)
-        cube_gate = cube_gate_dict["label"]
-        if "value" in cube_gate_dict:
-            logger.info(f"Hardcode {cube_gate}={cube_gate_dict['value']} as other option leads to contradiction")
-            instance.assign(cube_gate, cube_gate_dict["value"])
+        cube_gate_selection = self._select_cube_gate(instance)
+        
+        if cube_gate_selection is None:
+            logger.info(f"No candidates meet threshold - stopping at depth {depth}")
+            return [instance]
+        
+        if cube_gate_selection.is_forced:
+            logger.info(f"Hardcode {cube_gate_selection.label}={cube_gate_selection.forced_value} as other option leads to contradiction")
+            instance.assign(cube_gate_selection.label, cube_gate_selection.forced_value)
             return self._cube(instance, depth + 1)
 
         result = []
         for value in (False, True):
-            logger.info(f"Checking {cube_gate}={value}")
+            logger.info(f"Checking {cube_gate_selection.label}={value}")
             new_instance = copy.deepcopy(instance)
-            new_instance.assign(cube_gate, value)
+            new_instance.assign(cube_gate_selection.label, value)
             result.extend(self._cube(new_instance, depth + 1))
         return result
 
-    def _weight_gate(self, instance: CircuitSatInstance, gate_label: str) -> dict:
+    def _weight_gate(self, instance: CircuitSatInstance, gate_label: str) -> GateWeightResult:
         start_size = instance.circuit.size
         weight = 1
         for i in (False, True):
             new_instance = copy.deepcopy(instance)
             assign_status = new_instance.assign(gate_label, i)
-            # assert assign_status == AssignmentStatus.OK
             if assign_status != AssignmentStatus.OK:
-                return {
-                    "value": not i
-                }
+                return GateWeightResult(forced_value=not i)
             updated_size = new_instance.circuit.size
             mu = start_size - updated_size
             assert mu > 0
             weight *= mu
-        return {
-            "weight": weight
-        }
+        return GateWeightResult(weight=weight)
 
-    def _select_cube_gate(self, instance: CircuitSatInstance) -> dict:
+    def _select_cube_gate(self, instance: CircuitSatInstance) -> CubeGateSelection | None:
         best_gate_label = None
         best_weight = 0
         
         candidates = self._get_candidates(instance)
         
+        if not candidates:
+            return None  # No candidates meet threshold
+        
         for gate_label in candidates:
             gate = instance.circuit.get_gate(gate_label)
             assert gate is not None and gate not in (ALWAYS_TRUE, ALWAYS_FALSE, NOT), "Gate should not be constant or NOT"
                 
-            weight_dict = self._weight_gate(instance, gate_label)
-            if "value" in weight_dict:
-                return {
-                    "label": gate_label,
-                    "value": weight_dict["value"]
-                }
-            weight = weight_dict["weight"]
-            if weight > best_weight:
-                best_gate_label, best_weight = gate_label, weight
+            weight_result = self._weight_gate(instance, gate_label)
+            if weight_result.is_forced:
+                return CubeGateSelection(label=gate_label, forced_value=weight_result.forced_value)
+            if weight_result.weight > best_weight:
+                best_gate_label, best_weight = gate_label, weight_result.weight
         
         assert best_gate_label is not None, "Could not select a branching variable"
-        return {
-            "label": best_gate_label
-        }
+        return CubeGateSelection(label=best_gate_label)
 
     def _get_candidates(self, instance: CircuitSatInstance) -> list[str]:
         circuit = instance.circuit
@@ -136,9 +154,6 @@ class CubeAndConquerSolver:
                 continue
             assert gate.gate_type in (AND, INPUT), "Gate should be AND or INPUT"
             all_gates.append(gate_label)
-
-        if self.candidates_limit is None:
-            return all_gates
 
         # Score candidates
         scores: list[tuple[int, str]] = []
@@ -158,10 +173,15 @@ class CubeAndConquerSolver:
             scores.append((score, gate_label))
             
         scores.sort(key=lambda x: x[0], reverse=True)
-        return [x[1] for x in scores[:self.candidates_limit]]
+        
+        # Filter by score threshold
+        if self.score_threshold is not None:
+            scores = [(s, label) for s, label in scores if s > self.score_threshold]
+        scores = scores[:self.candidates_limit]
+        logger.info(f"Filtered {len(scores)} candidates by score threshold {self.score_threshold}, best: {scores[0][0] if scores else 'None'}")
+        return [x[1] for x in scores]
 
     def _check_stop_cube(self, instance: CircuitSatInstance, depth: int) -> bool:
-        # TODO: when to stop?
         if instance.circuit.input_size == 0:
             return True
         if self.max_depth is not None and depth >= self.max_depth: # reached max depth
