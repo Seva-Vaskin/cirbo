@@ -26,7 +26,7 @@ from cirbo.core.circuit import Transformer
 from cirbo.minimization import RemoveRedundantGates, MergeUnaryOperators
 from cirbo.minimization.simplification import RemoveConstantGates, MergeDuplicateGates
 from cirbo.sat import PySATSolverNames, is_circuit_satisfiable
-from cirbo.sat.solver.cnc_solver import CubeAndConquerSolver
+from cirbo.sat.solver.cnc_solver_old import CubeAndConquerSolver
 
 
 class SolverTimeout(Exception):
@@ -53,7 +53,9 @@ class ExperimentResult:
     max_depth: int | None
     min_circuit_size: int | None
     candidates_limit: int | None
-    score_threshold: float | None
+    hard_threshold: float | None
+    soft_threshold: float | None
+    soft_threshold_limit: int | None
     solver_name: str
     match: bool | None
     conquer_faster: bool | None
@@ -100,7 +102,9 @@ def run_cnc(
     max_depth: int | None,
     min_circuit_size: int | None,
     candidates_limit: int | None,
-    score_threshold: float | None,
+    hard_threshold: float | None,
+    soft_threshold: float | None,
+    soft_threshold_limit: int | None,
     solver_name: PySATSolverNames,
     timeout: int | None = None,
 ) -> tuple[bool | None, float | None, float | None, float | None, int | None, bool]:
@@ -119,7 +123,9 @@ def run_cnc(
             min_circuit_size=min_circuit_size,
             solver_name=solver_name,
             candidates_limit=candidates_limit,
-            score_threshold=score_threshold,
+            hard_threshold=hard_threshold,
+            soft_threshold=soft_threshold,
+            soft_threshold_limit=soft_threshold_limit,
         )
         
         t0 = time.time()
@@ -166,14 +172,16 @@ def generate_report(results: list[ExperimentResult], output_path: str) -> None:
         
         # Detailed results table
         f.write("## Detailed Results\n\n")
-        f.write("| Miter | depth | min_size | candidates | threshold | Baseline | **Conquer** | Faster? | Cube | Total | Cubes | Match |\n")
-        f.write("|-------|-------|----------|------------|-----------|----------|-------------|---------|------|-------|-------|-------|\n")
+        f.write("| Miter | depth | min_size | candidates | hard_th | soft_th | soft_lim | Baseline | **Conquer** | Faster? | Cube | Total | Cubes | Match |\n")
+        f.write("|-------|-------|----------|------------|---------|---------|----------|----------|-------------|---------|------|-------|-------|-------|\n")
         
         for r in results:
             depth_str = str(r.max_depth) if r.max_depth is not None else "None"
             min_size_str = str(r.min_circuit_size) if r.min_circuit_size is not None else "None"
             candidates_str = str(r.candidates_limit) if r.candidates_limit is not None else "None"
-            threshold_str = str(r.score_threshold) if r.score_threshold is not None else "None"
+            hard_th_str = str(r.hard_threshold) if r.hard_threshold is not None else "None"
+            soft_th_str = str(r.soft_threshold) if r.soft_threshold is not None else "None"
+            soft_lim_str = str(r.soft_threshold_limit) if r.soft_threshold_limit is not None else "None"
             
             # Format baseline
             if r.baseline_timed_out:
@@ -202,7 +210,7 @@ def generate_report(results: list[ExperimentResult], output_path: str) -> None:
                 match_mark = "✓" if r.match else "❌"
             
             f.write(
-                f"| {r.miter_name} | {depth_str} | {min_size_str} | {candidates_str} | {threshold_str} | "
+                f"| {r.miter_name} | {depth_str} | {min_size_str} | {candidates_str} | {hard_th_str} | {soft_th_str} | {soft_lim_str} | "
                 f"{baseline_str} | {cnc_str} | {faster_mark} | "
                 f"{cube_str} | {total_str} | {cubes_str} | {match_mark} |\n"
             )
@@ -229,7 +237,8 @@ def run_single_miter_experiment(
     max_depths: list[int | None],
     min_circuit_sizes: list[int | None],
     candidates_limits: list[int | None],
-    score_thresholds: list[float | None],
+    thresholds: list[tuple[float | None, float | None]],
+    soft_threshold_limits: list[int | None],
     solver_names: list[PySATSolverNames],
     timeout: int | None = None,
 ) -> list[ExperimentResult]:
@@ -262,21 +271,23 @@ def run_single_miter_experiment(
             print(f"Baseline ({solver_name.value}): {'SAT' if baseline_result else 'UNSAT'} in {baseline_time:.4f}s")
 
         param_combinations = itertools.product(
-            max_depths, min_circuit_sizes, candidates_limits, score_thresholds
+            max_depths, min_circuit_sizes, candidates_limits, thresholds, soft_threshold_limits
         )
-        for max_depth, min_circuit_size, candidates_limit, score_threshold in param_combinations:
+        for max_depth, min_circuit_size, candidates_limit, (hard_threshold, soft_threshold), soft_threshold_limit in param_combinations:
             # Run CnC with timeout
             cnc_result, cube_time, conquer_time, total_time, cnc_cubes, cnc_timed_out = run_cnc(
-                miter, max_depth, min_circuit_size, candidates_limit, score_threshold, solver_name, timeout
+                miter, max_depth, min_circuit_size, candidates_limit, hard_threshold, soft_threshold, soft_threshold_limit, solver_name, timeout
             )
             
             depth_str = str(max_depth) if max_depth is not None else "None"
             min_size_str = str(min_circuit_size) if min_circuit_size is not None else "None"
             candidates_str = str(candidates_limit) if candidates_limit is not None else "None"
-            threshold_str = str(score_threshold) if score_threshold is not None else "None"
+            hard_th_str = str(hard_threshold) if hard_threshold is not None else "None"
+            soft_th_str = str(soft_threshold) if soft_threshold is not None else "None"
+            soft_lim_str = str(soft_threshold_limit) if soft_threshold_limit is not None else "None"
             
             if cnc_timed_out:
-                print(f"  CnC (depth={depth_str}, min_size={min_size_str}, cand={candidates_str}, thresh={threshold_str}): TIMEOUT")
+                print(f"  CnC (depth={depth_str}, min_size={min_size_str}, cand={candidates_str}, hard={hard_th_str}, soft={soft_th_str}, lim={soft_lim_str}): TIMEOUT")
                 match = None
                 conquer_faster = None
             else:
@@ -289,7 +300,7 @@ def run_single_miter_experiment(
                 
                 status = "✓" if match else ("MISMATCH!" if match is False else "?")
                 faster = " (conquer faster)" if conquer_faster else ""
-                print(f"  CnC (depth={depth_str}, min_size={min_size_str}, cand={candidates_str}, thresh={threshold_str}): {'SAT' if cnc_result else 'UNSAT'} cube={cube_time:.4f}s conquer={conquer_time:.4f}s total={total_time:.4f}s, {cnc_cubes} cubes {status}{faster}")
+                print(f"  CnC (depth={depth_str}, min_size={min_size_str}, cand={candidates_str}, hard={hard_th_str}, soft={soft_th_str}, lim={soft_lim_str}): {'SAT' if cnc_result else 'UNSAT'} cube={cube_time:.4f}s conquer={conquer_time:.4f}s total={total_time:.4f}s, {cnc_cubes} cubes {status}{faster}")
 
             results.append(ExperimentResult(
                 miter_name=name,
@@ -305,7 +316,9 @@ def run_single_miter_experiment(
                 max_depth=max_depth,
                 min_circuit_size=min_circuit_size,
                 candidates_limit=candidates_limit,
-                score_threshold=score_threshold,
+                hard_threshold=hard_threshold,
+                soft_threshold=soft_threshold,
+                soft_threshold_limit=soft_threshold_limit,
                 solver_name=solver_name.value,
                 match=match,
                 conquer_faster=conquer_faster,
@@ -323,7 +336,8 @@ def run_experiment(
     max_depths: list[int | None],
     min_circuit_sizes: list[int | None],
     candidates_limits: list[int | None],
-    score_thresholds: list[float | None],
+    thresholds: list[tuple[float | None, float | None]],
+    soft_threshold_limits: list[int | None],
     solver_names: list[PySATSolverNames],
     timeout: int | None = None,
 ) -> list[ExperimentResult]:
@@ -350,7 +364,7 @@ def run_experiment(
         print(f"Miter {i+1}/{len(validated_miters)}: {path.name}")
         print(f"{'='*60}")
         
-        miter_results = run_single_miter_experiment(path, max_depths, min_circuit_sizes, candidates_limits, score_thresholds, solver_names, timeout)
+        miter_results = run_single_miter_experiment(path, max_depths, min_circuit_sizes, candidates_limits, thresholds, soft_threshold_limits, solver_names, timeout)
         all_results.extend(miter_results)
     
     # Generate report
@@ -392,7 +406,7 @@ def main():
         help="Timeout in seconds per solver call (default: no timeout)"
     )
     parser.add_argument(
-        "--depths", "-d",
+        "--depths", "-d", "--depth",
         type=str,
         default=None,
         help="Comma-separated list of max depths to test (use 'None' for unlimited). Example: '1,2,5' (default: None)"
@@ -415,7 +429,14 @@ def main():
         "--thresholds", "-th",
         type=str,
         default=None,
-        help="Comma-separated list of score thresholds (use 'None' for no threshold). Example: '10,50' (default: None)"
+        help="Comma-separated list of hard:soft threshold pairs. hard filters out candidates, soft increments counter. Use 'None' for no threshold. Example: '10:30,20:40,None:None' (default: None:None)"
+    )
+
+    parser.add_argument(
+        "--soft-threshold-limits", "-sl",
+        type=str,
+        default=None,
+        help="Comma-separated list of soft threshold limits (use 'None' for no limit). Stop recursion after this many soft threshold violations. Example: '3,5' (default: None)"
     )
 
     parser.add_argument(
@@ -462,17 +483,33 @@ def main():
             else:
                 candidates_limits.append(int(c))
     
-    # Parse score thresholds
-    score_thresholds: list[float | None] = []
+    # Parse thresholds (hard:soft pairs)
+    thresholds: list[tuple[float | None, float | None]] = []
     if args.thresholds is None:
-        score_thresholds.append(None)
+        thresholds.append((None, None))
     else:
-        for t in args.thresholds.split(","):
+        for pair in args.thresholds.split(","):
+            pair = pair.strip()
+            parts = pair.split(":")
+            if len(parts) != 2:
+                print(f"Error: Invalid threshold pair format '{pair}'. Expected 'hard:soft'.")
+                sys.exit(1)
+            hard_str, soft_str = parts[0].strip(), parts[1].strip()
+            hard_val = None if hard_str.lower() == "none" else float(hard_str)
+            soft_val = None if soft_str.lower() == "none" else float(soft_str)
+            thresholds.append((hard_val, soft_val))
+    
+    # Parse soft threshold limits
+    soft_threshold_limits: list[int | None] = []
+    if args.soft_threshold_limits is None:
+        soft_threshold_limits.append(None)
+    else:
+        for t in args.soft_threshold_limits.split(","):
             t = t.strip()
             if t.lower() == "none":
-                score_thresholds.append(None)
+                soft_threshold_limits.append(None)
             else:
-                score_thresholds.append(float(t))
+                soft_threshold_limits.append(int(t))
     
     # Get input miters list
     miters = args.input
@@ -483,7 +520,8 @@ def main():
     print(f"Depths: {max_depths}")
     print(f"Min circuit sizes: {min_circuit_sizes}")
     print(f"Candidates limits: {candidates_limits}")
-    print(f"Score thresholds: {score_thresholds}")
+    print(f"Thresholds (hard:soft): {thresholds}")
+    print(f"Soft threshold limits: {soft_threshold_limits}")
     
     # Configuration
     solver_names = [
@@ -496,7 +534,8 @@ def main():
         max_depths=max_depths,
         min_circuit_sizes=min_circuit_sizes,
         candidates_limits=candidates_limits,
-        score_thresholds=score_thresholds,
+        thresholds=thresholds,
+        soft_threshold_limits=soft_threshold_limits,
         solver_names=solver_names,
         timeout=args.timeout,
     )

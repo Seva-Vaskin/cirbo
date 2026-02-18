@@ -6,7 +6,7 @@ import pytest
 
 from cirbo.core.circuit import Circuit
 from cirbo.core.circuit.gate import Gate, AND, NOT, INPUT, ALWAYS_TRUE, ALWAYS_FALSE
-from cirbo.sat.solver.cnc_solver import CubeAndConquerSolver
+from cirbo.sat.solver.cnc_solver_old import CubeAndConquerSolver
 from cirbo.synthesis.generation.arithmetics import generate_mul, add_sum_two_numbers
 
 

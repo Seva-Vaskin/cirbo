@@ -1,202 +1,341 @@
 import copy
+import enum
 import logging
+import sys
+import uuid
 from dataclasses import dataclass
+import collections
+import typing as tp
 
-from cirbo.core.circuit import Circuit, ALWAYS_TRUE, ALWAYS_FALSE, INPUT, AND, NOT
-from cirbo.sat import PySatResult, is_satisfiable, PySATSolverNames
-from cirbo.sat.solver.circuit_sat_instance import CircuitSatInstance, AssignmentStatus
+from cirbo.core import Circuit
+from cirbo.core.circuit import gate, Transformer
+from cirbo.minimization.simplification import RemoveConstantGates
+from cirbo.sat import PySatResult, is_satisfiable, PySATSolverNames, Cnf
+from extensions.abc_wrapper.src.abc import abc_transform
+
+sys.setrecursionlimit(int(1e5))
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class GateWeightResult:
-    """Result of weighting a gate for cube selection."""
-    weight: int | None = None
-    forced_value: bool | None = None
+class GateAssignmentResult(enum.Enum):
+    OK = "OK"
+    CONFLICT = "CONFLICT"
 
-    @property
-    def is_forced(self) -> bool:
-        """Returns True if one branch leads to conflict, forcing the other value."""
-        return self.forced_value is not None
+    @classmethod
+    def from_is_conflict(cls, is_conflict: bool) -> "GateAssignmentResult":
+        if is_conflict:
+            return cls.CONFLICT
+        else:
+            return cls.OK
 
-
-@dataclass
-class CubeGateSelection:
-    """Result of selecting a gate for cube splitting."""
-    label: str
-    forced_value: bool | None = None
-
-    @property
-    def is_forced(self) -> bool:
-        """Returns True if this gate must take a specific value."""
-        return self.forced_value is not None
+    @classmethod
+    def from_is_ok(cls, is_ok: bool) -> "GateAssignmentResult":
+        if is_ok:
+            return cls.OK
+        else:
+            return cls.CONFLICT
 
 
 class CubeAndConquerSolver:
+    @dataclass
+    class Config:
+        max_depth: int = 2
+        scoring_candidates: int = 5
+        sat_solver: PySATSolverNames = PySATSolverNames.CADICAL195
+
+    @dataclass
+    class Cube:
+        ckt: Circuit
+        depth: int = 0
 
     def __init__(
-        self,
-        max_depth: int | None = None,
-        min_circuit_size: int | None = None,
-        solver_name: PySATSolverNames = PySATSolverNames.CADICAL195,
-        candidates_limit: int | None = None,
-        score_threshold: float | None = None,
+            self,
+            config: Config
     ):
-        self.max_depth = max_depth
-        self.min_circuit_size = min_circuit_size
-        self.solver_name = solver_name
-        self.candidates_limit = candidates_limit
-        self.score_threshold = score_threshold
+        self._config = config
 
-    def solve(self, circuit: Circuit) -> PySatResult:
-        cubes = self.cube(circuit)
+    @property
+    def config(self):
+        return self._config
+
+    def solve(self, circ: Circuit) -> PySatResult:
+        cubes = self.cube(circ)
         result = self.conquer(cubes)
         return result
 
-    def cube(self, circuit: Circuit) -> list[CircuitSatInstance]:
+    def cube(self, ckt: Circuit) -> list[Cube]:
+        result: list[CubeAndConquerSolver.Cube] = list()
 
-        logger.info("=" * 20)
-        logger.info(f"Cube for circuit with {circuit.size} gates")
-        logger.info("=" * 20)
-        circuit_sat_instance = CircuitSatInstance.from_circuit(circuit)
-        logger.info(f"Build an instance with {circuit_sat_instance.circuit.size} gates, {len(circuit_sat_instance.cnf.get_raw())} clauses")
-
-        if circuit_sat_instance is None:
-            return []  # empty list for trivially non-satisfiable case
-
-        return list(self._cube(circuit_sat_instance))
-
-    def conquer(self, cubes: list[CircuitSatInstance]) -> PySatResult:
-        for instance in cubes:
-            sat_result = self._solve_instance(instance)
-            if sat_result.answer:
-                # Build model combining pre-assigned values and SAT solver's model
-                model: list[int] = [0] * len(instance.gates_config)
-                for gate_conf in instance.gates_config.values():
-                    if not gate_conf.is_input:
-                        continue
-                    assert sat_result.model is not None
-                    lit = gate_conf.idx
-                    model[gate_conf.idx - 1] = lit if gate_conf.value else -lit
-                return PySatResult(answer=True, model=model)
-        return PySatResult(answer=False, model=None)
-
-    def _cube(self, instance: CircuitSatInstance, depth: int = 0) -> list[CircuitSatInstance]:
-        logger.info(f"Try cube. Depth {depth}, Circuit: {instance.circuit.size}, Cnf: {len(instance.cnf.get_raw())}")
-
-        if self._check_stop_cube(instance, depth):
-            logger.info(f"Stop! Depth {depth}, Circuit: {instance.circuit.size} gates, Cnf: {len(instance.cnf.get_raw())} clauses")
-            return [instance]
-
-        logger.info("Selecting cube gate...")
-        cube_gate_selection = self._select_cube_gate(instance)
-        
-        if cube_gate_selection is None:
-            logger.info(f"No candidates meet threshold - stopping at depth {depth}")
-            return [instance]
-        
-        if cube_gate_selection.is_forced:
-            logger.info(f"Hardcode {cube_gate_selection.label}={cube_gate_selection.forced_value} as other option leads to contradiction")
-            instance.assign(cube_gate_selection.label, cube_gate_selection.forced_value)
-            return self._cube(instance, depth + 1)
-
-        result = []
-        for value in (False, True):
-            logger.info(f"Checking {cube_gate_selection.label}={value}")
-            new_instance = copy.deepcopy(instance)
-            new_instance.assign(cube_gate_selection.label, value)
-            result.extend(self._cube(new_instance, depth + 1))
+        stack: collections.deque[CubeAndConquerSolver.Cube] = collections.deque()
+        stack.append(CubeAndConquerSolver.Cube(ckt=ckt))
+        while stack:
+            _cube = stack.pop()
+            _indent = '\t' * _cube.depth
+            logger.info(f"{_indent} Cube with {_cube.ckt.size} gates")
+            _cube.ckt = _simplify(_cube.ckt)
+            logger.info(f"{_indent} Simplified cube with {_cube.ckt.size} gates")
+            if self._should_stop_cubing(_cube):
+                result.append(_cube)
+                continue
+            new_cubes = self._cube_once(_cube)
+            stack.extend(new_cubes)
         return result
 
-    def _weight_gate(self, instance: CircuitSatInstance, gate_label: str) -> GateWeightResult:
-        start_size = instance.circuit.size
-        weight = 1
-        for i in (False, True):
-            new_instance = copy.deepcopy(instance)
-            assign_status = new_instance.assign(gate_label, i)
-            if assign_status != AssignmentStatus.OK:
-                return GateWeightResult(forced_value=not i)
-            updated_size = new_instance.circuit.size
-            mu = start_size - updated_size
-            assert mu > 0
-            weight *= mu
-        return GateWeightResult(weight=weight)
+    def conquer(self, cubes: list[Cube]) -> PySatResult:
+        for i, cube in enumerate(cubes):
+            # #region agent log
+            import json as _json; open("/home/vsevolod/Work/cirbo/.cursor/debug.log","a").write(_json.dumps({"location":"cnc_solver.py:conquer","message":"cube_info","data":{"cube_idx":i,"total_cubes":len(cubes),"ckt_size":cube.ckt.size,"output_size":cube.ckt.output_size,"input_size":cube.ckt.input_size,"depth":cube.depth},"timestamp":__import__('time').time(),"hypothesisId":"A"})+"\n")
+            # #endregion
+            cnf = Cnf.from_circuit(cube.ckt)
+            # #region agent log
+            open("/home/vsevolod/Work/cirbo/.cursor/debug.log","a").write(_json.dumps({"location":"cnc_solver.py:conquer","message":"cnf_info","data":{"cube_idx":i,"num_clauses":len(cnf.get_raw())},"timestamp":__import__('time').time(),"hypothesisId":"A"})+"\n")
+            # #endregion
+            result = is_satisfiable(
+                cnf=cnf,
+                solver_name=self.config.sat_solver,
+            )
+            # #region agent log
+            open("/home/vsevolod/Work/cirbo/.cursor/debug.log","a").write(_json.dumps({"location":"cnc_solver.py:conquer","message":"sat_result","data":{"cube_idx":i,"answer":result.answer,"model_len":len(result.model) if result.model is not None else None},"timestamp":__import__('time').time(),"hypothesisId":"A"})+"\n")
+            # #endregion
+            if result.answer:
+                return result
+        return PySatResult(answer=False, model=None)
 
-    def _select_cube_gate(self, instance: CircuitSatInstance) -> CubeGateSelection | None:
-        best_gate_label = None
-        best_weight = 0
-        
-        candidates = self._get_candidates(instance)
-        
-        if not candidates:
-            return None  # No candidates meet threshold
-        
-        for gate_label in candidates:
-            gate = instance.circuit.get_gate(gate_label)
-            assert gate is not None and gate not in (ALWAYS_TRUE, ALWAYS_FALSE, NOT), "Gate should not be constant or NOT"
-                
-            weight_result = self._weight_gate(instance, gate_label)
-            if weight_result.is_forced:
-                return CubeGateSelection(label=gate_label, forced_value=weight_result.forced_value)
-            if weight_result.weight > best_weight:
-                best_gate_label, best_weight = gate_label, weight_result.weight
-        
-        assert best_gate_label is not None, "Could not select a branching variable"
-        return CubeGateSelection(label=best_gate_label)
-
-    def _get_candidates(self, instance: CircuitSatInstance) -> list[str]:
-        circuit = instance.circuit
-        all_gates = []
-        for gate_label in circuit.gates:
-            gate = circuit.get_gate(gate_label)
-            if gate.gate_type in (ALWAYS_TRUE, ALWAYS_FALSE, NOT):
-                continue
-            assert gate.gate_type in (AND, INPUT), "Gate should be AND or INPUT"
-            all_gates.append(gate_label)
-
-        # Score candidates
-        scores: list[tuple[int, str]] = []
-        for gate_label in all_gates:
-            gate = circuit.get_gate(gate_label)
-            indegree = len(gate.operands)
-
-            # Calculate outdegree ignoring NOTs, but only look at neighbors and their neighbors
-            outdegree = 0
-            for user_label in circuit.get_gate_users(gate_label):
-                if circuit.get_gate(user_label).gate_type == NOT:
-                    outdegree += len(circuit.get_gate_users(user_label))
-                else:
-                    outdegree += 1
-            
-            score = (indegree + 1) * (outdegree + 1)
-            scores.append((score, gate_label))
-            
-        scores.sort(key=lambda x: x[0], reverse=True)
-        
-        # Filter by score threshold
-        if self.score_threshold is not None:
-            scores = [(s, label) for s, label in scores if s > self.score_threshold]
-        scores = scores[:self.candidates_limit]
-        logger.info(f"Filtered {len(scores)} candidates by score threshold {self.score_threshold}, best: {scores[0][0] if scores else 'None'}")
-        return [x[1] for x in scores]
-
-    def _check_stop_cube(self, instance: CircuitSatInstance, depth: int) -> bool:
-        if instance.circuit.input_size == 0:
+    def _should_stop_cubing(self, cube: Cube) -> bool:
+        if cube.depth > self.config.max_depth:
             return True
-        if self.max_depth is not None and depth >= self.max_depth: # reached max depth
+        
+        has_and_gates = any(g.gate_type == gate.AND for g in cube.ckt.gates.values())
+        if not has_and_gates:
             return True
-        if self.min_circuit_size is not None and instance.circuit.size <= self.min_circuit_size: # reached min circuit size
-            return True
+        
         return False
 
-    def _solve_instance(self, instance: CircuitSatInstance) -> PySatResult:
-        """Solve a cube instance and return the full SAT result."""
-        return is_satisfiable(
-            cnf=instance.cnf,
-            solver_name=self.solver_name,
+    def _cube_once(self, _cube: Cube) -> list[Cube]:
+        selected_gate, gate_score_res = self._select_cube_gate(_cube)
+        result = []
+
+        def cube_into_value(value: bool):
+            new_ckt = copy.deepcopy(_cube.ckt)
+            res, new_ckt = _assign_gate(new_ckt, selected_gate.label, value)
+            result.append(
+                self.Cube(
+                    ckt=new_ckt,
+                    depth=_cube.depth + 1
+                )
+            )
+
+        match gate_score_res.status:
+            case GateScoreResult.Status.CONFLICT:
+                return []
+            case GateScoreResult.Status.FORCED_VALUE:
+                cube_into_value(gate_score_res.forced_value)
+            case GateScoreResult.Status.SCORED:
+                cube_into_value(False)
+                cube_into_value(True)
+
+        return result
+
+    def _select_cube_gate(self, _cube: Cube) -> tp.Tuple[gate.Gate, "GateScoreResult"]:
+        fast_scored = [
+            (_fast_gate_score(_cube.ckt, g), g)
+            for g in _cube.ckt.gates.values()
+            if g.gate_type == gate.AND
+        ]
+        fast_scored.sort(key=lambda x: x[0], reverse=True)
+
+        best_gate: tp.Optional[gate.Gate] = None
+        best_score: tp.Optional[GateScoreResult] = None
+        for (_, g) in fast_scored[:self.config.scoring_candidates]:
+            gate_scored = _slow_gate_score(_cube.ckt, g)
+            match gate_scored.status:
+                case gate_scored.Status.CONFLICT:
+                    return g, gate_scored
+                case gate_scored.Status.FORCED_VALUE:
+                    best_gate = g
+                    best_score = gate_scored
+                case gate_scored.Status.SCORED:
+                    assert gate_scored.score is not None
+
+                    if best_score is None or (
+                            best_score.status == GateScoreResult.Status.SCORED and
+                            best_score.score < gate_scored.score
+                    ):
+                        best_score = gate_scored
+                        best_gate = g
+        return best_gate, best_score
+
+
+def _assign_gate(ckt: Circuit, label: str, value: bool) -> tuple[GateAssignmentResult, Circuit]:
+    _gate = ckt.get_gate(label)
+
+    if _gate.label in ckt.outputs and not value:
+        # if output is False it is immediate conflict
+        return GateAssignmentResult.from_is_conflict(True), ckt
+
+    match _gate.gate_type:
+        case gate.ALWAYS_TRUE | gate.ALWAYS_FALSE:
+            return GateAssignmentResult.from_is_conflict(_gate.operator() != value), ckt
+        case gate.INPUT:
+            ckt = _assign_input_gate(ckt, _gate, value)
+            return GateAssignmentResult.OK, ckt
+        case gate.NOT:
+            return _assign_not_gate(ckt, _gate, value)
+        case gate.IFF:
+            return _assign_iff_gate(ckt, _gate, value)
+        case gate.AND:
+            return _assign_and_gate(ckt, _gate, value)
+        case _:
+            raise Exception(f"Propagation error: Unsupported operator {_gate.gate_type}")
+
+
+def _simplify(ckt: Circuit) -> Circuit:
+    ckt = Transformer.apply_transformers(ckt, [
+        RemoveConstantGates(),
+    ])
+    if ckt.output_size > 0:
+        ckt = abc_transform(ckt, "fraig")
+    return ckt
+
+
+def _simplify_light(ckt: Circuit) -> Circuit:
+    ckt = Transformer.apply_transformers(ckt, [
+        RemoveConstantGates(),
+    ])
+    return ckt
+
+
+def _assign_input_gate(ckt: Circuit, _gate: gate.Gate, value: bool) -> Circuit:
+    assert _gate.gate_type == gate.INPUT
+    inputs_to_true, inputs_to_false = [], []
+    (inputs_to_true if value else inputs_to_false).append(_gate.label)
+    return ckt.replace_inputs(inputs_to_true, inputs_to_false)
+
+
+def _replace_gate_to_const(ckt: Circuit, _gate: gate.Gate, value: bool) -> None:
+    label = _gate.label
+
+    # delete users
+    for operand in _gate.operands:
+        ckt._remove_user(gate_label=operand, user=label)
+
+    # replace gate
+    new_gate_type = gate.ALWAYS_TRUE if value else gate.ALWAYS_FALSE
+    new_gate = gate.Gate(label=label, gate_type=new_gate_type, operands=())
+    ckt._gates[label] = new_gate
+
+
+def _assign_not_gate(ckt: Circuit, _gate: gate.Gate, value: bool) -> tuple[GateAssignmentResult, Circuit]:
+    assert _gate.gate_type == gate.NOT
+    assert len(_gate.operands) == 1
+    _replace_gate_to_const(ckt, _gate, value)
+    return _assign_gate(ckt, _gate.operands[0], not value)
+
+
+def _assign_iff_gate(ckt: Circuit, _gate: gate.Gate, value: bool) -> tuple[GateAssignmentResult, Circuit]:
+    assert _gate.gate_type == gate.IFF
+    assert len(_gate.operands) == 1
+    _replace_gate_to_const(ckt, _gate, value)
+    return _assign_gate(ckt, _gate.operands[0], value)
+
+
+def _assign_and_gate(ckt: Circuit, _gate: gate.Gate, value: bool) -> tuple[GateAssignmentResult, Circuit]:
+    assert _gate.gate_type == gate.AND
+    assert len(_gate.operands) == 2
+
+    if value:
+        _replace_gate_to_const(ckt, _gate, True)
+        for operand in _gate.operands:
+            assignment_res, ckt = _assign_gate(ckt, operand, True)
+            if assignment_res != GateAssignmentResult.OK:
+                return assignment_res, ckt
+            ckt.mark_as_output(operand)
+        return GateAssignmentResult.OK, ckt
+    else:
+        # No replacement to const, just add a constraint that this gate is always false
+        label = f"not_{_gate.label}_{uuid.uuid4().hex[:12]}"
+        ckt.emplace_gate(label, gate.NOT, (_gate.label,))
+        ckt.mark_as_output(label)
+        return GateAssignmentResult.OK, ckt
+
+
+def _fast_gate_score(ckt: Circuit, _gate: gate.Gate) -> int:
+    indegree = len(_gate.operands)
+    outdegree = 0
+    for user_label in ckt.get_gate_users(_gate.label):
+        user_gate = ckt.get_gate(user_label)
+        match user_gate.gate_type:
+            case gate.NOT | gate.IFF:
+                outdegree += len(ckt.get_gate_users(user_label))
+            case gate.AND:
+                outdegree += 1
+            case _:
+                raise Exception(f"_fast_gate_score: Not supported case: {user_gate.gate_type}")
+
+    score = (indegree + 1) * (outdegree + 1)
+    return score
+
+
+@dataclass
+class GateScoreResult:
+    class Status(enum.Enum):
+        FORCED_VALUE = enum.auto()
+        CONFLICT = enum.auto()
+        SCORED = enum.auto()
+
+    status: Status
+    forced_value: tp.Optional[bool] = None
+    score: tp.Optional[int] = None
+
+    @classmethod
+    def from_score(cls, score: int) -> "GateScoreResult":
+        return GateScoreResult(
+            status=cls.Status.SCORED,
+            score=score
         )
 
-    # def is_sat(self, instance: CircuitSatInstance) -> bool:
-    #     """Check if a cube instance is satisfiable."""
-    #     return self._solve_instance(instance).answer
+    @classmethod
+    def from_forced(cls, value: bool) -> "GateScoreResult":
+        return GateScoreResult(
+            status=cls.Status.FORCED_VALUE,
+            forced_value=value
+        )
+
+    @classmethod
+    def from_conflict(cls) -> "GateScoreResult":
+        return GateScoreResult(status=cls.Status.CONFLICT)
+
+
+def _count_and_gates(ckt: Circuit) -> int:
+    return sum(map(lambda g: g.gate_type == gate.AND, ckt.gates.values()))
+
+
+def _slow_gate_score(ckt: Circuit, _gate: gate.Gate) -> GateScoreResult:
+    ckt_0 = copy.deepcopy(ckt)
+    res_0, ckt_0 = _assign_gate(ckt_0, _gate.label, value=False)
+    ckt_0 = _simplify_light(ckt_0)
+
+    ckt_1 = copy.deepcopy(ckt)
+    res_1, ckt_1 = _assign_gate(ckt_1, _gate.label, value=True)
+    ckt_1 = _simplify_light(ckt_1)
+
+    match (res_0, res_1):
+        case (GateAssignmentResult.CONFLICT, GateAssignmentResult.CONFLICT):
+            return GateScoreResult.from_conflict()
+        case (GateAssignmentResult.CONFLICT, GateAssignmentResult.OK):
+            return GateScoreResult.from_forced(value=True)
+        case (GateAssignmentResult.OK, GateAssignmentResult.CONFLICT):
+            return GateScoreResult.from_forced(value=False)
+        case (GateAssignmentResult.OK, GateAssignmentResult.OK):
+            size_orig = _count_and_gates(ckt)
+            size_0 = _count_and_gates(ckt_0)
+            size_1 = _count_and_gates(ckt_1)
+            diff_0 = size_orig - size_0
+            diff_1 = size_orig - size_1
+            assert diff_0 >= 0
+            assert diff_1 >= 0
+            score = (diff_0 + 1) * (diff_1 + 1)
+            return GateScoreResult.from_score(score=score)
+        case _:
+            raise Exception("This line is unreachable")

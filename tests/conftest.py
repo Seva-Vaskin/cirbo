@@ -16,3 +16,4 @@ def pytest_addoption(parser):
 def pytest_configure(config):
     config.addinivalue_line("markers", "db_xaig: mark test as related to xaig database")
     config.addinivalue_line("markers", "db_aig: mark test as related to aig database")
+    config.addinivalue_line("markers", "heavy: mark test as heavy (long-running)")
