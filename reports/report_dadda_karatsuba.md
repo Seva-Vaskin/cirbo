@@ -34,3 +34,4 @@
 - **Max conquer speedup:** 2.27x
 - **Average total speedup (baseline/total):** 0.67x
 - **Max total speedup:** 1.30x
+
