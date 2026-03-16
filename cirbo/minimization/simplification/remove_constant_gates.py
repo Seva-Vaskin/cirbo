@@ -35,10 +35,16 @@ class RemoveConstantGates(Transformer):
 
     __idempotent__: bool = True
 
-    def __init__(self):
+    def __init__(self, keep_false_outputs: bool = False):
+        """
+        :param keep_false_outputs: If True, outputs that evaluate to constant
+            False are preserved as ALWAYS_FALSE gates instead of being removed.
+            Useful in SAT contexts where a False output means UNSAT.
+        """
         super().__init__(post_transformers=(
             # MergeUnaryOperators(),
         ))
+        self._keep_false_outputs = keep_false_outputs
 
     def _transform(self, circuit: Circuit) -> Circuit:
         """
@@ -141,9 +147,17 @@ class RemoveConstantGates(Transformer):
 
         # Set outputs to the remaining outputs.
         # We need to resolve outputs that might have been remapped
-        final_outputs = [
-            out for out in map(resolve_label, circuit.outputs) if out not in const_map
-        ]
+        final_outputs = []
+        _false_cnt = 0
+        for out in circuit.outputs:
+            resolved = resolve_label(out)
+            if resolved not in const_map:
+                final_outputs.append(resolved)
+            elif self._keep_false_outputs and const_map[resolved] is False:
+                false_label = f"__const_false_{_false_cnt}"
+                _false_cnt += 1
+                new_circuit.emplace_gate(false_label, gate.ALWAYS_FALSE, ())
+                final_outputs.append(false_label)
         new_circuit.set_outputs(final_outputs)
 
         return new_circuit

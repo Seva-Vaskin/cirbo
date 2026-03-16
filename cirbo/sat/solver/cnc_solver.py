@@ -51,7 +51,7 @@ class CubeAndConquerSolver:
 
     def __init__(
             self,
-            config: Config
+            config: Config = Config()
     ):
         self._config = config
 
@@ -73,7 +73,10 @@ class CubeAndConquerSolver:
             _cube = stack.pop()
             _indent = '\t' * _cube.depth
             logger.info(f"{_indent} Cube with {_cube.ckt.size} gates")
-            _cube.ckt = _simplify(_cube.ckt)
+            _simplified = _simplify(_cube.ckt)
+            if _simplified is None:
+                continue
+            _cube.ckt = _simplified
             logger.info(f"{_indent} Simplified cube with {_cube.ckt.size} gates")
             if self._should_stop_cubing(_cube):
                 result.append(_cube)
@@ -84,20 +87,11 @@ class CubeAndConquerSolver:
 
     def conquer(self, cubes: list[Cube]) -> PySatResult:
         for i, cube in enumerate(cubes):
-            # #region agent log
-            import json as _json; open("/home/vsevolod/Work/cirbo/.cursor/debug.log","a").write(_json.dumps({"location":"cnc_solver.py:conquer","message":"cube_info","data":{"cube_idx":i,"total_cubes":len(cubes),"ckt_size":cube.ckt.size,"output_size":cube.ckt.output_size,"input_size":cube.ckt.input_size,"depth":cube.depth},"timestamp":__import__('time').time(),"hypothesisId":"A"})+"\n")
-            # #endregion
             cnf = Cnf.from_circuit(cube.ckt)
-            # #region agent log
-            open("/home/vsevolod/Work/cirbo/.cursor/debug.log","a").write(_json.dumps({"location":"cnc_solver.py:conquer","message":"cnf_info","data":{"cube_idx":i,"num_clauses":len(cnf.get_raw())},"timestamp":__import__('time').time(),"hypothesisId":"A"})+"\n")
-            # #endregion
             result = is_satisfiable(
                 cnf=cnf,
                 solver_name=self.config.sat_solver,
             )
-            # #region agent log
-            open("/home/vsevolod/Work/cirbo/.cursor/debug.log","a").write(_json.dumps({"location":"cnc_solver.py:conquer","message":"sat_result","data":{"cube_idx":i,"answer":result.answer,"model_len":len(result.model) if result.model is not None else None},"timestamp":__import__('time').time(),"hypothesisId":"A"})+"\n")
-            # #endregion
             if result.answer:
                 return result
         return PySatResult(answer=False, model=None)
@@ -190,12 +184,18 @@ def _assign_gate(ckt: Circuit, label: str, value: bool) -> tuple[GateAssignmentR
             raise Exception(f"Propagation error: Unsupported operator {_gate.gate_type}")
 
 
-def _simplify(ckt: Circuit) -> Circuit:
+def _simplify(ckt: Circuit) -> tp.Optional[Circuit]:
+    """Simplify the circuit. Returns None if a contradiction (ALWAYS_FALSE output) is detected."""
     ckt = Transformer.apply_transformers(ckt, [
-        RemoveConstantGates(),
+        RemoveConstantGates(keep_false_outputs=True),
     ])
+    if any(ckt.get_gate(ckt.output_at_index(i)).gate_type == gate.ALWAYS_FALSE for i in range(ckt.output_size)):
+        return None
     if ckt.output_size > 0:
+        orig_outputs = ckt.output_size
+        logger.info(f"Simplify: Applying Fraig to circuit with {orig_outputs} outputs")
         ckt = abc_transform(ckt, "fraig")
+        logger.info(f"Simplify: Fraig applied to circuit with {ckt.output_size} outputs, improvement {(ckt.size - orig_outputs)/orig_outputs*100}%")
     return ckt
 
 
