@@ -65,6 +65,7 @@ class CubeAndConquerSolver:
         return result
 
     def cube(self, ckt: Circuit) -> list[Cube]:
+
         result: list[CubeAndConquerSolver.Cube] = list()
 
         stack: collections.deque[CubeAndConquerSolver.Cube] = collections.deque()
@@ -72,7 +73,7 @@ class CubeAndConquerSolver:
         while stack:
             _cube = stack.pop()
             _indent = '\t' * _cube.depth
-            logger.info(f"{_indent} Cube with {_cube.ckt.size} gates")
+            print(f"{_indent} Cube with {_cube.ckt.size} gates, outputs {_cube.ckt.output_size}, depth {_cube.depth}")
             _simplified = _simplify(_cube.ckt)
             if _simplified is None:
                 continue
@@ -192,10 +193,10 @@ def _simplify(ckt: Circuit) -> tp.Optional[Circuit]:
     if any(ckt.get_gate(ckt.output_at_index(i)).gate_type == gate.ALWAYS_FALSE for i in range(ckt.output_size)):
         return None
     if ckt.output_size > 0:
-        orig_outputs = ckt.output_size
-        logger.info(f"Simplify: Applying Fraig to circuit with {orig_outputs} outputs")
-        ckt = abc_transform(ckt, "fraig")
-        logger.info(f"Simplify: Fraig applied to circuit with {ckt.output_size} outputs, improvement {(ckt.size - orig_outputs)/orig_outputs*100}%")
+        orig_size = ckt.size
+        logger.info(f"Simplify: Applying Fraig to circuit with {orig_size} gates")
+        ckt = abc_transform(ckt, "strash; &get; &fraig; &put")
+        logger.info(f"Simplify: Fraig applied to circuit with {ckt.size} gates, improvement {(ckt.size - orig_size)/orig_size*100}%")
     return ckt
 
 
