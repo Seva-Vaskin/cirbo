@@ -2,6 +2,7 @@ import copy
 import enum
 import logging
 import sys
+import time
 import uuid
 from dataclasses import dataclass
 import collections
@@ -48,6 +49,8 @@ class CubeAndConquerSolver:
     class Cube:
         ckt: Circuit
         depth: int = 0
+        parent_size: tp.Optional[int] = None
+        delta_size: tp.Optional[int] = None
 
     def __init__(
             self,
@@ -74,14 +77,18 @@ class CubeAndConquerSolver:
         while stack:
             states_visited += 1
             _cube = stack.pop()
-            _indent = '\t' * _cube.depth
+            _indent = '  ' * _cube.depth
             print(f"{_indent} Cube with {_cube.ckt.size} gates, outputs {_cube.ckt.output_size}, depth {_cube.depth}")
-            _simplified = _simplify(_cube.ckt)
+            _simplified = _simplify(_cube.ckt, indent=_indent)
             if _simplified is None:
+                print(f"{_indent} Stopping cubing at depth {_cube.depth} with {_cube.ckt.size} gates (simplification found contradiction)")
                 continue
             _cube.ckt = _simplified
+            if _cube.parent_size is not None:
+                _cube.delta_size = _cube.parent_size - _cube.ckt.size
             logger.info(f"{_indent} Simplified cube with {_cube.ckt.size} gates")
             if self._should_stop_cubing(_cube):
+                # print(f"{_indent} Stopping cubing at depth {_cube.depth} with {_cube.ckt.size} gates (should stop cubing)")
                 result.append(_cube)
                 continue
             new_cubes = self._cube_once(_cube)
@@ -102,10 +109,17 @@ class CubeAndConquerSolver:
 
     def _should_stop_cubing(self, cube: Cube) -> bool:
         if cube.depth > self.config.max_depth:
+            indent = '  ' * cube.depth
+            print(f"{indent} Stopping cubing at depth {cube.depth} with {cube.ckt.size} gates (max depth reached)")
             return True
+
+        # if cube.delta_size is not None and cube.delta_size <= 1:
+        #     return True
         
         has_and_gates = any(g.gate_type == gate.AND for g in cube.ckt.gates.values())
         if not has_and_gates:
+            indent = '  ' * cube.depth
+            print(f"{indent} Stopping cubing at depth {cube.depth} with {cube.ckt.size} gates (no AND gates)")
             return True
         
         return False
@@ -120,7 +134,8 @@ class CubeAndConquerSolver:
             result.append(
                 self.Cube(
                     ckt=new_ckt,
-                    depth=_cube.depth + 1
+                    depth=_cube.depth + 1,
+                    parent_size=_cube.ckt.size,
                 )
             )
 
@@ -188,7 +203,7 @@ def _assign_gate(ckt: Circuit, label: str, value: bool) -> tuple[GateAssignmentR
             raise Exception(f"Propagation error: Unsupported operator {_gate.gate_type}")
 
 
-def _simplify(ckt: Circuit) -> tp.Optional[Circuit]:
+def _simplify(ckt: Circuit, indent: str = '') -> tp.Optional[Circuit]:
     """Simplify the circuit. Returns None if a contradiction (ALWAYS_FALSE output) is detected."""
     ckt = Transformer.apply_transformers(ckt, [
         RemoveConstantGates(keep_false_outputs=True),
@@ -197,9 +212,11 @@ def _simplify(ckt: Circuit) -> tp.Optional[Circuit]:
         return None
     if ckt.output_size > 0:
         orig_size = ckt.size
-        logger.info(f"Simplify: Applying Fraig to circuit with {orig_size} gates")
-        ckt = abc_transform(ckt, "strash; &get; &fraig -x -L 20; &put")
-        logger.info(f"Simplify: Fraig applied to circuit with {ckt.size} gates, improvement {(ckt.size - orig_size)/orig_size*100}%")
+        logger.info(f"{indent}Simplify: Applying Fraig to circuit with {orig_size} gates")
+        time_start = time.time()
+        ckt = abc_transform(ckt, "strash; &get; &fraig -x -L 40 -C 1000; &put")
+        time_end = time.time()
+        print(f"{indent}Simplify: Fraig applied to circuit with {ckt.size} gates, improvement {(ckt.size - orig_size)/orig_size*100:.2f}%, took {time_end - time_start:.2f} seconds")
     return ckt
 
 
@@ -230,6 +247,31 @@ def _replace_gate_to_const(ckt: Circuit, _gate: gate.Gate, value: bool) -> None:
     ckt._gates[label] = new_gate
 
 
+def _replace_gate_in_users(
+    ckt: Circuit,
+    old_label: str,
+    new_label: str,
+) -> None:
+    for user_label in list(dict.fromkeys(ckt.get_gate_users(old_label))):
+        user_gate = ckt.get_gate(user_label)
+        new_operands = []
+        replaced = False
+        for operand in user_gate.operands:
+            if operand == old_label:
+                ckt._remove_user(old_label, user_label)
+                ckt._add_user(new_label, user_label)
+                new_operands.append(new_label)
+                replaced = True
+            else:
+                new_operands.append(operand)
+        if replaced:
+            ckt._gates[user_label] = gate.Gate(
+                label=user_gate.label,
+                gate_type=user_gate.gate_type,
+                operands=tuple(new_operands),
+            )
+
+
 def _assign_not_gate(ckt: Circuit, _gate: gate.Gate, value: bool) -> tuple[GateAssignmentResult, Circuit]:
     assert _gate.gate_type == gate.NOT
     assert len(_gate.operands) == 1
@@ -257,6 +299,12 @@ def _assign_and_gate(ckt: Circuit, _gate: gate.Gate, value: bool) -> tuple[GateA
             ckt.mark_as_output(operand)
         return GateAssignmentResult.OK, ckt
     else:
+        user_labels = ckt.get_gate_users(_gate.label)
+        if user_labels:
+            false_label = f"false_{_gate.label}_{uuid.uuid4().hex[:12]}"
+            ckt.emplace_gate(false_label, gate.ALWAYS_FALSE)
+            _replace_gate_in_users(ckt, _gate.label, false_label)
+
         # No replacement to const, just add a constraint that this gate is always false
         label = f"not_{_gate.label}_{uuid.uuid4().hex[:12]}"
         ckt.emplace_gate(label, gate.NOT, (_gate.label,))

@@ -6,7 +6,7 @@ import pytest
 
 from cirbo.core.circuit import Circuit
 from cirbo.core.circuit.gate import Gate, AND, NOT, INPUT, ALWAYS_TRUE, ALWAYS_FALSE
-from cirbo.sat.solver.cnc_solver import CubeAndConquerSolver
+from cirbo.sat.solver.cnc_solver import CubeAndConquerSolver, _assign_gate, GateAssignmentResult
 from cirbo.synthesis.generation.arithmetics import generate_mul, add_sum_two_numbers
 
 CnCConfig = CubeAndConquerSolver.Config
@@ -256,6 +256,36 @@ class TestCnCSolverBasicSAT:
 
 class TestCnCSolverBasicUNSAT:
     """Basic UNSAT tests with trivially unsatisfiable circuits."""
+
+    def test_assigning_internal_and_to_false_rewires_all_users_to_const(self):
+        """Test that assigning an internal AND to False rewires all its users to ALWAYS_FALSE."""
+        circuit = Circuit()
+        circuit.add_gate(Gate('a', INPUT))
+        circuit.add_gate(Gate('b', INPUT))
+        circuit.add_gate(Gate('c', INPUT))
+        circuit.add_gate(Gate('and1', AND, ('a', 'b')))
+        circuit.add_gate(Gate('and2', AND, ('and1', 'c')))
+        circuit.add_gate(Gate('not_and1', NOT, ('and1',)))
+        circuit.add_gate(Gate('out', AND, ('and2', 'not_and1')))
+        circuit.mark_as_output('out')
+
+        assignment_res, circuit = _assign_gate(circuit, 'and1', False)
+
+        assert assignment_res == GateAssignmentResult.OK
+
+        false_gates = [
+            g.label
+            for g in circuit.gates.values()
+            if g.gate_type == ALWAYS_FALSE
+        ]
+        assert len(false_gates) == 1
+
+        false_label = false_gates[0]
+        assert circuit.get_gate('and2').operands == (false_label, 'c')
+        assert circuit.get_gate('not_and1').operands == (false_label,)
+        assert 'and2' in circuit.get_gate_users(false_label)
+        assert 'not_and1' in circuit.get_gate_users(false_label)
+        assert circuit.get_gate_users('and1') == [circuit.outputs[-1]]
     
     def test_always_false_via_and(self):
         """Test circuit that is always false through AND logic - unsatisfiable."""
