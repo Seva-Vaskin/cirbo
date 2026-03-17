@@ -70,7 +70,9 @@ class CubeAndConquerSolver:
 
         stack: collections.deque[CubeAndConquerSolver.Cube] = collections.deque()
         stack.append(CubeAndConquerSolver.Cube(ckt=ckt))
+        states_visited = 0
         while stack:
+            states_visited += 1
             _cube = stack.pop()
             _indent = '\t' * _cube.depth
             print(f"{_indent} Cube with {_cube.ckt.size} gates, outputs {_cube.ckt.output_size}, depth {_cube.depth}")
@@ -84,6 +86,7 @@ class CubeAndConquerSolver:
                 continue
             new_cubes = self._cube_once(_cube)
             stack.extend(new_cubes)
+        print(f"States visited: {states_visited}")
         return result
 
     def conquer(self, cubes: list[Cube]) -> PySatResult:
@@ -195,7 +198,7 @@ def _simplify(ckt: Circuit) -> tp.Optional[Circuit]:
     if ckt.output_size > 0:
         orig_size = ckt.size
         logger.info(f"Simplify: Applying Fraig to circuit with {orig_size} gates")
-        ckt = abc_transform(ckt, "strash; &get; &fraig; &put")
+        ckt = abc_transform(ckt, "strash; &get; &fraig -x -L 20; &put")
         logger.info(f"Simplify: Fraig applied to circuit with {ckt.size} gates, improvement {(ckt.size - orig_size)/orig_size*100}%")
     return ckt
 
