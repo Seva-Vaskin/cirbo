@@ -64,3 +64,13 @@ class Cnf:
     def get_var(self, label: str) -> tp.Optional[Lit]:
         """Get variable number by label."""
         return self._var_map.get(label)
+
+    def to_dimacs(self) -> str:
+        """Serialize the CNF formula to DIMACS format."""
+        if not self._cnf:
+            return "p cnf 0 0\n"
+        num_vars = max(abs(lit) for clause in self._cnf for lit in clause)
+        lines = [f"p cnf {num_vars} {len(self._cnf)}"]
+        for clause in self._cnf:
+            lines.append(" ".join(str(lit) for lit in clause) + " 0")
+        return "\n".join(lines) + "\n"

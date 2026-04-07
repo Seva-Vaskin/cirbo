@@ -11,7 +11,7 @@ import typing as tp
 from cirbo.core import Circuit
 from cirbo.core.circuit import gate, Transformer
 from cirbo.minimization.simplification import RemoveConstantGates
-from cirbo.sat import PySatResult, is_satisfiable, PySATSolverNames, Cnf
+from cirbo.sat import PySatResult, is_satisfiable, PySATSolverNames, ExternalSolver, SolverSpec, Cnf
 from extensions.abc_wrapper.src.abc import abc_transform
 
 sys.setrecursionlimit(int(1e5))
@@ -43,7 +43,8 @@ class CubeAndConquerSolver:
     class Config:
         max_depth: int = 2
         scoring_candidates: int = 5
-        sat_solver: PySATSolverNames = PySATSolverNames.CADICAL195
+        sat_solver: SolverSpec = PySATSolverNames.CADICAL195
+        min_improvement_pct: tp.Optional[float] = 1
 
     @dataclass
     class Cube:
@@ -79,11 +80,17 @@ class CubeAndConquerSolver:
             _cube = stack.pop()
             _indent = '  ' * _cube.depth
             print(f"{_indent} Cube with {_cube.ckt.size} gates, outputs {_cube.ckt.output_size}, depth {_cube.depth}")
-            _simplified = _simplify(_cube.ckt, indent=_indent)
+            _simplified, _improvement_pct = _simplify(_cube.ckt, indent=_indent)
             if _simplified is None:
                 print(f"{_indent} Stopping cubing at depth {_cube.depth} with {_cube.ckt.size} gates (simplification found contradiction)")
                 continue
             _cube.ckt = _simplified
+            if (self._config.min_improvement_pct is not None
+                    and _improvement_pct is not None
+                    and _improvement_pct < self._config.min_improvement_pct):
+                print(f"{_indent} Stopping cubing at depth {_cube.depth}: improvement {_improvement_pct:.2f}% < min {self._config.min_improvement_pct:.2f}%")
+                result.append(_cube)
+                continue
             if _cube.parent_size is not None:
                 _cube.delta_size = _cube.parent_size - _cube.ckt.size
             logger.info(f"{_indent} Simplified cube with {_cube.ckt.size} gates")
@@ -99,10 +106,7 @@ class CubeAndConquerSolver:
     def conquer(self, cubes: list[Cube]) -> PySatResult:
         for i, cube in enumerate(cubes):
             cnf = Cnf.from_circuit(cube.ckt)
-            result = is_satisfiable(
-                cnf=cnf,
-                solver_name=self.config.sat_solver,
-            )
+            result = is_satisfiable(cnf=cnf, solver_name=self.config.sat_solver)
             if result.answer:
                 return result
         return PySatResult(answer=False, model=None)
@@ -203,21 +207,29 @@ def _assign_gate(ckt: Circuit, label: str, value: bool) -> tuple[GateAssignmentR
             raise Exception(f"Propagation error: Unsupported operator {_gate.gate_type}")
 
 
-def _simplify(ckt: Circuit, indent: str = '') -> tp.Optional[Circuit]:
-    """Simplify the circuit. Returns None if a contradiction (ALWAYS_FALSE output) is detected."""
+def _simplify(ckt: Circuit, indent: str = '') -> tp.Tuple[tp.Optional[Circuit], tp.Optional[float]]:
+    """Simplify the circuit.
+
+    Returns a tuple of (circuit, improvement_pct).
+    circuit is None if a contradiction (ALWAYS_FALSE output) is detected.
+    improvement_pct is None when Fraig is not applied (e.g. no outputs),
+    otherwise the percentage of gate reduction (positive means smaller).
+    """
     ckt = Transformer.apply_transformers(ckt, [
         RemoveConstantGates(keep_false_outputs=True),
     ])
     if any(ckt.get_gate(ckt.output_at_index(i)).gate_type == gate.ALWAYS_FALSE for i in range(ckt.output_size)):
-        return None
+        return None, None
     if ckt.output_size > 0:
         orig_size = ckt.size
         logger.info(f"{indent} Simplify: Applying Fraig to circuit with {orig_size} gates")
         time_start = time.time()
         ckt = abc_transform(ckt, "strash; &get; &fraig -x -L 40 -C 1000; &put")
         time_end = time.time()
-        print(f"{indent} Simplify: Fraig applied to circuit with {ckt.size} gates, improvement {(ckt.size - orig_size)/orig_size*100:.2f}%, took {time_end - time_start:.2f} seconds")
-    return ckt
+        improvement_pct = (orig_size - ckt.size) / orig_size * 100
+        print(f"{indent} Simplify: Fraig applied to circuit with {ckt.size} gates, improvement {improvement_pct:.2f}%, took {time_end - time_start:.2f} seconds")
+        return ckt, improvement_pct
+    return ckt, None
 
 
 def _simplify_light(ckt: Circuit) -> Circuit:
