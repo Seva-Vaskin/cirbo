@@ -212,11 +212,11 @@ def _simplify(ckt: Circuit, indent: str = '') -> tp.Optional[Circuit]:
         return None
     if ckt.output_size > 0:
         orig_size = ckt.size
-        logger.info(f"{indent}Simplify: Applying Fraig to circuit with {orig_size} gates")
+        logger.info(f"{indent} Simplify: Applying Fraig to circuit with {orig_size} gates")
         time_start = time.time()
         ckt = abc_transform(ckt, "strash; &get; &fraig -x -L 40 -C 1000; &put")
         time_end = time.time()
-        print(f"{indent}Simplify: Fraig applied to circuit with {ckt.size} gates, improvement {(ckt.size - orig_size)/orig_size*100:.2f}%, took {time_end - time_start:.2f} seconds")
+        print(f"{indent} Simplify: Fraig applied to circuit with {ckt.size} gates, improvement {(ckt.size - orig_size)/orig_size*100:.2f}%, took {time_end - time_start:.2f} seconds")
     return ckt
 
 
