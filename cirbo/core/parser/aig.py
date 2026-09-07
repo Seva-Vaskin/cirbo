@@ -8,6 +8,7 @@ Note: This implementation only supports combinational circuits (L=0, no latches)
 
 """
 
+import collections
 import io
 import logging
 import pathlib
@@ -15,19 +16,25 @@ import typing as tp
 
 from cirbo.core.circuit import gate
 from cirbo.core.circuit.circuit import Circuit
-
+from cirbo.exceptions import CirboError
 
 logger = logging.getLogger(__name__)
 
-__all__ = ['AIGParser']
+__all__ = [
+    'AIGParser',
+    'AIGParseError',
+]
 
 
-class AIGParseError(Exception):
+class AIGParseError(CirboError):
     """Error during AIG file parsing."""
 
     pass
 
 
+# FIXME: must inherit AbstractParser, but currently it is not a useful
+#        abstraction, hence ignored here. Need redesign in future
+#        (e.g. need to split this parser into two classes).
 class AIGParser:
     """
     Parser for AIGER format files (both ASCII .aag and binary .aig).
@@ -53,28 +60,29 @@ class AIGParser:
 
         """
         path = pathlib.Path(file_path)
-        if path.suffix == '.aag':
-            with path.open('r') as f:
-                return self._parse_ascii(f)
-        elif path.suffix == '.aig':
+
+        if path.suffix.lower() == '.aig':
             with path.open('rb') as f:
                 return self._parse_binary(f)
-        else:
-            # Try to detect format from header
-            with path.open('rb') as f:
-                header_start = f.read(3)
-                f.seek(0)
-                if header_start == b'aag':
-                    # Re-open as text
-                    pass
-                elif header_start == b'aig':
-                    return self._parse_binary(f)
-                else:
-                    raise AIGParseError(
-                        f"Unknown file format. Header starts with: {header_start!r}"
-                    )
+
+        if path.suffix.lower() == '.aag':
             with path.open('r') as f:
                 return self._parse_ascii(f)
+
+        # Try to detect format from header
+        with path.open('rb') as f:
+            header_start = f.read(3)
+            if header_start == b'aig':
+                f.seek(0)
+                return self._parse_binary(f)
+
+        if header_start == b'aag':
+            with path.open('r') as f:
+                return self._parse_ascii(f)
+
+        raise AIGParseError(
+            f"Unknown file format. Header starts with: {header_start!r}"
+        )
 
     def parse_string(self, content: str) -> Circuit:
         """
@@ -97,11 +105,12 @@ class AIGParser:
         """
         if content.startswith(b'aag'):
             return self.parse_string(content.decode('ascii'))
-        elif content.startswith(b'aig'):
+
+        if content.startswith(b'aig'):
             with io.BytesIO(content) as f:
                 return self._parse_binary(f)
-        else:
-            raise AIGParseError("Unknown format. Must start with 'aag' or 'aig'.")
+
+        raise AIGParseError("Unknown format. Must start with 'aag' or 'aig'.")
 
     def _parse_ascii(self, stream: tp.TextIO) -> Circuit:
         """Parse ASCII AIG format (.aag)."""
@@ -139,7 +148,7 @@ class AIGParser:
                 raise AIGParseError(f"Input literal must be even, got {lit}")
             input_literals.append(lit)
             label = f"i{idx}"
-            self._circuit._emplace_gate(label, gate.INPUT)
+            self._circuit.unchecked_emplace_gate(label, gate.INPUT)
             self._literal_to_label[lit] = label
             logger.debug(f"Input {idx}: literal={lit}, label={label}")
 
@@ -192,41 +201,53 @@ class AIGParser:
         return self._circuit
 
     def _create_and_gates_topological(
-        self, and_gates: list[tuple[int, int, int]]
+        self,
+        and_gates: list[tuple[int, int, int]],
     ) -> None:
-        """Create AND gates in topological order to handle forward references."""
-        # Build dependency graph
-        lhs_set = {lhs for lhs, _, _ in and_gates}
-        gate_map = {lhs: (rhs0, rhs1) for lhs, rhs0, rhs1 in and_gates}
-        created: set[int] = set()
+        """Create AND gates in topological order."""
 
         def get_base_literal(lit: int) -> int:
             """Get the base (even) literal for any literal."""
             return lit & ~1  # Clear the LSB
 
-        def create_gate(lhs: int) -> None:
-            """Recursively create a gate and its dependencies."""
-            if lhs in created:
-                return
+        lhs_set = {lhs for lhs, _, _ in and_gates}
+        gate_map = {lhs: (rhs0, rhs1) for lhs, rhs0, rhs1 in and_gates}
 
+        # Number of AND gates each gate depends on.
+        indegree: dict[int, int] = {lhs: 0 for lhs in lhs_set}
+
+        # {gate: [users...]} -- maps gate to users that depend on it
+        users: dict[int, list[int]] = {lhs: [] for lhs in lhs_set}
+
+        for lhs, rhs0, rhs1 in and_gates:
+            dependencies = {
+                get_base_literal(rhs)
+                for rhs in (rhs0, rhs1)
+                if get_base_literal(rhs) in lhs_set
+            }
+
+            indegree[lhs] = len(dependencies)
+
+            for dependency in dependencies:
+                users[dependency].append(lhs)
+
+        queue = collections.deque(lhs for lhs, _, _ in and_gates if indegree[lhs] == 0)
+        created = 0
+
+        while queue:
+            lhs = queue.popleft()
             rhs0, rhs1 = gate_map[lhs]
 
-            # Create dependencies first
-            base0 = get_base_literal(rhs0)
-            base1 = get_base_literal(rhs1)
-
-            if base0 in lhs_set and base0 not in created:
-                create_gate(base0)
-            if base1 in lhs_set and base1 not in created:
-                create_gate(base1)
-
-            # Now create this gate
             self._add_and_gate_internal(lhs, rhs0, rhs1)
-            created.add(lhs)
+            created += 1
 
-        # Create all gates
-        for lhs, _, _ in and_gates:
-            create_gate(lhs)
+            for user in users[lhs]:
+                indegree[user] -= 1
+                if indegree[user] == 0:
+                    queue.append(user)
+
+        if created != len(and_gates):
+            raise AIGParseError("Cyclic dependency between AND gates")
 
     def _parse_binary(self, stream: tp.BinaryIO) -> Circuit:
         """Parse binary AIG format (.aig)."""
@@ -235,15 +256,7 @@ class AIGParser:
         self._symbols = {'i': {}, 'o': {}, 'l': {}}
 
         # Parse header (ASCII part)
-        header_line = b''
-        while True:
-            ch = stream.read(1)
-            if ch == b'\n':
-                break
-            if not ch:
-                raise AIGParseError("Unexpected EOF while reading header")
-            header_line += ch
-
+        header_line = _parse_binary_line_from_stream(stream, context="header")
         header_str = header_line.decode('ascii').strip()
         header_parts = header_str.split()
 
@@ -268,21 +281,14 @@ class AIGParser:
             lit = 2 * (idx + 1)
             input_literals.append(lit)
             label = f"i{idx}"
-            self._circuit._emplace_gate(label, gate.INPUT)
+            self._circuit.unchecked_emplace_gate(label, gate.INPUT)
             self._literal_to_label[lit] = label
             logger.debug(f"Input {idx}: literal={lit}, label={label}")
 
         # Parse output literals (ASCII, one per line)
         output_literals: list[int] = []
         for idx in range(o):
-            line = b''
-            while True:
-                ch = stream.read(1)
-                if ch == b'\n':
-                    break
-                if not ch:
-                    raise AIGParseError("Unexpected EOF while reading outputs")
-                line += ch
+            line = _parse_binary_line_from_stream(stream, context="output literals")
             output_literals.append(int(line.decode('ascii').strip()))
             logger.debug(f"Output {idx}: literal={output_literals[-1]}")
 
@@ -376,7 +382,9 @@ class AIGParser:
 
         # Create the AND gate
         and_label = self._literal_to_label[lhs]
-        self._circuit._emplace_gate(and_label, gate.AND, (op0_label, op1_label))
+        self._circuit.unchecked_emplace_gate(
+            and_label, gate.AND, (op0_label, op1_label)
+        )
 
     def _get_literal_label(self, literal: int) -> gate.Label:
         """
@@ -401,8 +409,8 @@ class AIGParser:
             not_label = f"not_{base_label}"
 
             # Check if NOT gate already exists
-            if not_label not in self._circuit.gates:
-                self._circuit._emplace_gate(not_label, gate.NOT, (base_label,))
+            if not self._circuit.has_gate(not_label):
+                self._circuit.unchecked_emplace_gate(not_label, gate.NOT, (base_label,))
 
             self._literal_to_label[literal] = not_label
             return not_label
@@ -413,14 +421,14 @@ class AIGParser:
         """Get or create an ALWAYS_FALSE gate."""
         label = "__false__"
         if label not in self._circuit.gates:
-            self._circuit._emplace_gate(label, gate.ALWAYS_FALSE)
+            self._circuit.unchecked_emplace_gate(label, gate.ALWAYS_FALSE)
         return label
 
     def _get_or_create_true(self) -> gate.Label:
         """Get or create an ALWAYS_TRUE gate."""
         label = "__true__"
         if label not in self._circuit.gates:
-            self._circuit._emplace_gate(label, gate.ALWAYS_TRUE)
+            self._circuit.unchecked_emplace_gate(label, gate.ALWAYS_TRUE)
         return label
 
     def _parse_symbol(self, line: str) -> None:
@@ -429,23 +437,23 @@ class AIGParser:
             return
 
         sym_type = line[0]
-        rest = line[1:]
-
+        space_idx = line.find(' ', 1)
         # Find the position number
-        space_idx = rest.find(' ')
         if space_idx == -1:
             return
 
         try:
-            pos = int(rest[:space_idx])
-            name = rest[space_idx + 1 :]
+            pos = int(line[1:space_idx])
+            name = line[space_idx + 1 :]
             self._symbols[sym_type][pos] = name
             logger.debug(f"Symbol: {sym_type}{pos} = {name}")
         except ValueError:
             pass
 
     def _apply_symbols(
-        self, input_literals: list[int], output_literals: list[int]
+        self,
+        input_literals: list[int],
+        output_literals: list[int],
     ) -> None:
         """Apply symbol names to inputs by renaming gates."""
         # Rename inputs if symbols are provided
@@ -457,80 +465,28 @@ class AIGParser:
                     self._rename_gate_in_parser(old_label, new_label, lit)
 
     def _rename_gate_in_parser(
-        self, old_label: gate.Label, new_label: gate.Label, literal: int
+        self,
+        old_label: gate.Label,
+        new_label: gate.Label,
+        literal: int,
     ) -> None:
         """Rename a gate during parsing, updating all references."""
-        if new_label in self._circuit.gates:
+        if self._circuit.has_gate(new_label):
             # Name conflict, keep original
             return
 
-        # Get the gate
-        old_gate = self._circuit.gates[old_label]
-
-        # First, handle any NOT gates that reference this gate
         old_not_label = f"not_{old_label}"
         new_not_label = f"not_{new_label}"
-        if old_not_label in self._circuit.gates:
-            # Remove old NOT gate
-            del self._circuit._gates[old_not_label]
-            if old_not_label in self._circuit._gate_to_users:
-                del self._circuit._gate_to_users[old_not_label]
 
-            # Update literal_to_label for the NOT gate
-            for lit, label in list(self._literal_to_label.items()):
-                if label == old_not_label:
-                    self._literal_to_label[lit] = new_not_label
-
-            # Will be recreated after the main gate is renamed
-
-        # Remove old gate
-        del self._circuit._gates[old_label]
-        if old_label in self._circuit._inputs:
-            self._circuit._inputs.remove(old_label)
-        if old_label in self._circuit._gate_to_users:
-            del self._circuit._gate_to_users[old_label]
-
-        # Add with new label
-        self._circuit._emplace_gate(new_label, old_gate.gate_type, old_gate.operands)
+        self._circuit.rename_gate(old_label, new_label)
         self._literal_to_label[literal] = new_label
 
-        # Now recreate NOT gate with new name if it existed
-        if old_not_label in [f"not_{old_label}"]:
-            # Check if we need to recreate it
-            for lit, label in list(self._literal_to_label.items()):
-                if label == new_not_label and new_not_label not in self._circuit.gates:
-                    self._circuit._emplace_gate(new_not_label, gate.NOT, (new_label,))
-                    break
+        if self._circuit.has_gate(old_not_label):
+            self._circuit.rename_gate(old_not_label, new_not_label)
 
-        # Update any gates that reference the old label or old NOT label
-        for gate_label, g in list(self._circuit._gates.items()):
-            needs_update = False
-            new_operands = []
-            for op in g.operands:
-                if op == old_label:
-                    new_operands.append(new_label)
-                    needs_update = True
-                elif op == old_not_label:
-                    new_operands.append(new_not_label)
-                    needs_update = True
-                else:
-                    new_operands.append(op)
-            if needs_update:
-                # Need to rebuild gate and update users
-                self._circuit._gates[gate_label] = gate.Gate(
-                    gate_label, g.gate_type, tuple(new_operands)
-                )
-                # Update user tracking
-                if new_label in new_operands:
-                    if new_label not in self._circuit._gate_to_users:
-                        self._circuit._gate_to_users[new_label] = []
-                    if gate_label not in self._circuit._gate_to_users[new_label]:
-                        self._circuit._gate_to_users[new_label].append(gate_label)
-                if new_not_label in new_operands:
-                    if new_not_label not in self._circuit._gate_to_users:
-                        self._circuit._gate_to_users[new_not_label] = []
-                    if gate_label not in self._circuit._gate_to_users[new_not_label]:
-                        self._circuit._gate_to_users[new_not_label].append(gate_label)
+            for lit, label in self._literal_to_label.items():
+                if label == old_not_label:
+                    self._literal_to_label[lit] = new_not_label
 
     def _set_outputs(self, output_literals: list[int]) -> None:
         """Set the circuit outputs based on output literals."""
@@ -542,8 +498,31 @@ class AIGParser:
                 output_name = self._symbols['o'][idx]
                 # Create an IFF gate to give the output a proper name
                 if output_name not in self._circuit.gates:
-                    self._circuit._emplace_gate(output_name, gate.IFF, (label,))
+                    self._circuit.unchecked_emplace_gate(
+                        output_name,
+                        gate.IFF,
+                        (label,),
+                    )
                     label = output_name
             output_labels.append(label)
 
         self._circuit.set_outputs(output_labels)
+
+
+def _parse_binary_line_from_stream(
+    stream: tp.BinaryIO,
+    *,
+    context: str = "UNKNOWN",
+) -> bytes:
+    parsed_line = b''
+    while True:
+        ch = stream.read(1)
+
+        if not ch:
+            raise AIGParseError(f"Unexpected EOF while parsing {context}")
+
+        if ch == b'\n':
+            break
+        parsed_line += ch
+
+    return parsed_line

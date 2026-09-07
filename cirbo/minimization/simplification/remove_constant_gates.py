@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 # Constant gate types that this transformer handles.
-_CONST_GATES = (gate.ALWAYS_TRUE, gate.ALWAYS_FALSE)
+_CONST_GATES = {gate.ALWAYS_TRUE, gate.ALWAYS_FALSE}
 
 # Mapping from (out_when_var_is_0, out_when_var_is_1) to the resulting gate type.
 # Used to determine the simplified gate type when one operand is constant.

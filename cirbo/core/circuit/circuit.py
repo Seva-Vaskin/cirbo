@@ -550,6 +550,28 @@ class Circuit(Function):
 
         return self._emplace_gate(label, gate_type, operands, **kwargs)
 
+    def unchecked_emplace_gate(
+        self,
+        label: gate.Label,
+        gate_type: gate.GateType,
+        operands: tuple[gate.Label, ...] = (),
+        **kwargs,
+    ) -> tp_ext.Self:
+        """
+        Add gate in the circuit without neither checking that it is not already there,
+        or validating that its operands exist.
+
+        Note: this method should NOT be used in most of the cases.
+
+        :param label: new gate's label.
+        :param gate_type: new gate's type of operator.
+        :param operands: new gate's operands.
+        :param kwargs: others parameters for constructing new gate.
+        :return: this circuit after modification.
+
+        """
+        return self._emplace_gate(label, gate_type, operands, **kwargs)
+
     def make_block_from_slice(
         self,
         name: gate.Label,

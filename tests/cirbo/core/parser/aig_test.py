@@ -8,6 +8,9 @@ from cirbo.core.circuit.gate import ALWAYS_FALSE, ALWAYS_TRUE, IFF, NOT
 from cirbo.core.parser.aig import AIGParseError, AIGParser
 
 
+# FIXME: tests for binary aig required.
+
+
 def get_file_path(file_name: str) -> str:
     return str(
         pathlib.Path(os.path.dirname(__file__)).joinpath('./aigs/').joinpath(file_name)
