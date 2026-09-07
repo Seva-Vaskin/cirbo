@@ -11,28 +11,59 @@ option(DISABLE_ABC_CEXT "Controls if ABC should be compiled." OFF)
 # Note: must be before mockturtle's CMakeLists is added.
 SET(MOCKTURTLE_EXAMPLES OFF CACHE BOOL "Build examples" FORCE)
 
-# Disabled because it requires gnu readline to be installed on build
-# machine, but not necessary for the ABC compilation as library.
-list(APPEND ABC_READLINE_FLAGS "ABC_USE_NO_READLINE=1")
-
 add_subdirectory(third_party/pybind11)
 add_subdirectory(third_party/mockturtle)
 
 pybind11_add_module(mockturtle_wrapper extensions/mockturtle_wrapper/src/module.cpp)
-
 target_link_libraries(mockturtle_wrapper PRIVATE mockturtle)
-
 target_include_directories(mockturtle_wrapper PRIVATE third_party)
-
 
 # ABC related libs can be disabled using environment variable.
 IF(NOT DISABLE_ABC_CEXT)
+    # Disabled because it requires gnu readline to be installed on build
+    # machine, but is not necessary for the ABC compilation as library.
+    set(READLINE_FOUND FALSE CACHE BOOL "" FORCE)
+
     add_subdirectory(third_party/abc)
-    # Needed for correct library compilation.
-    target_compile_options(libabc PRIVATE -fPIC)
+
+    # ABC exports its private -fno-exceptions flag to consumers.
+    # Remove it from the interface; ABC itself is still built with this flag.
+    get_target_property(ABC_INTERFACE_OPTIONS libabc-pic INTERFACE_COMPILE_OPTIONS)
+
+    if(ABC_INTERFACE_OPTIONS)
+        set(ABC_FILTERED_INTERFACE_OPTIONS)
+
+        foreach(OPTION ${ABC_INTERFACE_OPTIONS})
+            if(NOT OPTION MATCHES "fno-exceptions")
+                list(APPEND ABC_FILTERED_INTERFACE_OPTIONS "${OPTION}")
+            endif()
+        endforeach()
+
+        set_target_properties(libabc-pic PROPERTIES
+            INTERFACE_COMPILE_OPTIONS "${ABC_FILTERED_INTERFACE_OPTIONS}"
+        )
+    endif()
 
     pybind11_add_module(abc_wrapper extensions/abc_wrapper/src/module.cpp)
-
-    target_link_libraries(abc_wrapper PRIVATE libabc)
+    target_link_libraries(abc_wrapper PRIVATE libabc-pic)
     target_include_directories(abc_wrapper PRIVATE third_party)
+
+    # Fixes case in CI, when ABC compilation
+    # fails with "#error unknown platform" on
+    # macos runners (both intel and apple silicon).
+    if(NOT WIN32)
+      target_compile_definitions(abc_wrapper PRIVATE ABC_USE_STDINT_H)
+      target_compile_definitions(libabc-pic PRIVATE ABC_USE_STDINT_H)
+      if(TARGET libabc)
+        target_compile_definitions(libabc PRIVATE ABC_USE_STDINT_H)
+      endif()
+    endif()
+
+    if (MSVC)
+      # Fixes Windows build: `pthreads-win32` tried to redefine `timespec`.
+      target_compile_definitions(libabc-pic PRIVATE HAVE_STRUCT_TIMESPEC=1)
+      if(TARGET libabc)
+        target_compile_definitions(libabc PRIVATE HAVE_STRUCT_TIMESPEC=1)
+      endif()
+    endif()
 ENDIF(NOT DISABLE_ABC_CEXT)
